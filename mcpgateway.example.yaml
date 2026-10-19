@@ -1,0 +1,81 @@
+# mcpgateway.yaml — one process fronting all your MCP servers.
+# The config file is TRUSTED operator input (like sshd_config): it names the
+# commands to spawn and the URLs to call. Keep it readable only by you
+# (chmod 600) — it holds the credentials your servers need.
+
+gateway:
+  name: mcpgateway
+
+servers:
+  # stdio server: spawned with shell:false and an argv array (never a shell
+  # string). The child inherits a small safe-default env (PATH, HOME, ...) plus
+  # everything under `env` below.
+  - name: github
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"   # ${VAR} and ${VAR:-default} supported
+    concurrency: 1                      # stdio servers are usually single-threaded
+    timeoutMs: 60000                    # per tool-call timeout
+
+  # Streamable HTTP server.
+  - name: docs
+    transport: http
+    url: http://localhost:8080/mcp
+    headers:
+      Authorization: "Bearer ${DOCS_TOKEN:-changeme}"
+    concurrency: 8
+
+namespace:
+  strategy: prefix        # prefix | priority | explicit
+  separator: "__"         # github + create_issue -> github__create_issue
+  priority: [github]      # priority strategy: earlier wins the bare name
+  mappings: {}            # explicit strategy: {"toolName": "winningServer"}
+  aliases: {}             # {"server:tool": "friendlyName"}
+
+rateLimits:
+  default: { rps: 10, burst: 20 }
+  tools:
+    github__search_code: { rps: 2, burst: 4 }
+
+policy:
+  mode: enforce           # enforce | observe (observe logs would-be verdicts, forwards everything)
+  allowTools: ["*"]       # glob patterns; deny wins over allow
+  denyTools: []
+  hideTools: []           # hidden from tools/list AND denied on call
+  argRules: {}            # {"tool*": {deny: ["substring"], allow: ["substring"]}} — substring, not regex
+  responseRedact: []      # substrings replaced with [REDACTED] in results
+  responseBlock: []       # substrings that block the result entirely
+  responseWarn: []        # substrings that only audit-log a warning
+
+auth:
+  disabled: false
+  keys:
+    - id: agent-1
+      key: "${GATEWAY_KEY:-changeme-to-a-long-random-secret}"
+      scopes: ["tools:call", "tools:list"]   # + resources:*, prompts:*, admin
+
+audit:
+  path: ./mcpgateway-audit.jsonl
+  logArgs: true           # false -> only a sha256 of args is logged
+  redactKeys: [token, secret, password]      # key-name substrings, case-insensitive
+  maxArgsChars: 8192
+  maxSizeMB: 100
+  keepFiles: 5
+
+admin:
+  enabled: true
+  host: 127.0.0.1        # never 0.0.0.0 without allowPublicAdmin: true
+  port: 3001
+
+upstream:
+  stdio: { enabled: true }                          # drop-in: swap the agent's server command
+  http:
+    enabled: false
+    host: 127.0.0.1
+    port: 3000
+    maxSessions: 128    # abandoned SSE sessions can't grow this table forever
+
+globalMaxInflight: 256    # hard cap on concurrent tool calls gateway-wide
+maxResultChars: 10000000  # drop tool results larger than this (OOM guard)
