@@ -5,6 +5,8 @@ interface Args {
     http: boolean;
     output: string;
     force: boolean;
+    rest: string[];
+    keyEnv?: string;
 }
 declare function parseArgs(argv: string[]): Args;
 export { parseArgs };

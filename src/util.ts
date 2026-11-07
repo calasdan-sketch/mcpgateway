@@ -1,5 +1,5 @@
 /** Small shared helpers. No dependencies. */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 
 /** Unique id for correlating audit records, metrics and error responses. */
 export function newRequestId(): string {
@@ -47,4 +47,32 @@ export function nowIso(): string {
 export function globMatch(pattern: string, value: string): boolean {
   const escaped = pattern.split('*').map((part) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&'));
   return new RegExp(`^${escaped.join('.*')}$`).test(value);
+}
+
+const sha = (s: string): Buffer => createHash('sha256').update(s, 'utf8').digest();
+
+/**
+ * Constant-time bearer-key lookup. Compares SHA-256 digests (always 32 bytes)
+ * and scans every key, so neither the presented key's length nor the position
+ * of the matching key leaks through timing.
+ */
+export function matchKey<K extends { key: string }>(keys: K[], presented: string): K | null {
+  const p = sha(presented);
+  let found: K | null = null;
+  for (const k of keys) {
+    if (timingSafeEqual(p, sha(k.key)) && found === null) found = k;
+  }
+  return found;
+}
+
+/**
+ * Strip terminal-control, bidi-override and zero-width characters from
+ * untrusted text (tool descriptions, server names in logs). Replaced with a
+ * visible U+FFFD so tampering is evident, not silent.
+ */
+// eslint-disable-next-line no-control-regex
+const HOSTILE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g;
+export function stripHostile(s: string): { text: string; changed: boolean } {
+  const text = s.replace(HOSTILE, '\ufffd');
+  return { text, changed: text !== s };
 }

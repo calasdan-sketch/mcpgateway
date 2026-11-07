@@ -25,6 +25,10 @@ export interface AdminDeps {
     getServers: () => DownstreamServer[];
     getNamespace: () => NamespaceResult | null;
     reloadCatalogs: () => Promise<void>;
+    pins?: {
+        violations: () => string[];
+        accept: (key?: string) => string[];
+    };
 }
 export declare function startAdmin(deps: AdminDeps, host: string, port: number): Promise<HttpServer>;
 //# sourceMappingURL=admin.d.ts.map

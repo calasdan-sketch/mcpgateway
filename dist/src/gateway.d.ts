@@ -7,13 +7,13 @@
  * collision under `explicit` strategy) keeps the previous table and logs a
  * warning — a misbehaving server must never take the gateway's namespace down.
  */
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { AuditLogger } from './audit.js';
 import { Metrics } from './metrics.js';
 import { DownstreamServer } from './downstream.js';
 import { GatewayUpstream } from './upstream.js';
 import { type NamespaceResult } from './namespace.js';
 import { type GatewayConfig } from './config.js';
+import { PinRegistry } from './pins.js';
 export interface Gateway {
     config: GatewayConfig;
     servers: DownstreamServer[];
@@ -21,6 +21,7 @@ export interface Gateway {
     audit: AuditLogger;
     metrics: Metrics;
     getNamespace(): NamespaceResult | null;
+    pins: PinRegistry;
     reloadCatalogs(): Promise<void>;
     close(): Promise<void>;
     /** set when upstream.http.enabled */
@@ -30,7 +31,7 @@ export interface Gateway {
 }
 export interface StartOptions {
     /** Test hook: pre-built transports keyed by server name (skips spawning). */
-    transportOverrides?: Map<string, Transport>;
+    transportOverrides?: Map<string, import('./downstream.js').TransportOverride>;
     /** Skip starting the admin HTTP API (tests). */
     noAdmin?: boolean;
     /** Where operational logs go (stderr in stdio mode). Defaults to console. */

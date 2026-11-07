@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AuditLogger, collectSecretValues, redactDeep, redactSecretValues } from '../src/audit.js';
@@ -100,7 +100,11 @@ test('rotation bounds disk usage', () => {
 });
 
 test('unwritable path never throws; errors are counted', () => {
-  const log = new AuditLogger(baseAudit({ path: '/nonexistent-dir-xyz/audit.jsonl' }));
+  // A path *under a regular file* can never be created — unlike a made-up
+  // absolute directory, which another process (or root) may have created.
+  const blocker = join(mkdtempSync(join(tmpdir(), 'mcpgw-blk-')), 'file');
+  writeFileSync(blocker, 'x');
+  const log = new AuditLogger(baseAudit({ path: join(blocker, 'audit.jsonl') }));
   assert.doesNotThrow(() => log.log(baseRecord()));
   assert.ok(log.errors > 0);
 });

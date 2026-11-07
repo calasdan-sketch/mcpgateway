@@ -18,7 +18,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { CallToolResultSchema, PromptListChangedNotificationSchema, ResourceListChangedNotificationSchema, ToolListChangedNotificationSchema, } from '@modelcontextprotocol/sdk/types.js';
+import { CallToolResultSchema, ErrorCode, McpError, PromptListChangedNotificationSchema, ResourceListChangedNotificationSchema, ToolListChangedNotificationSchema, } from '@modelcontextprotocol/sdk/types.js';
 import { VERSION } from './version.js';
 import { sleep, withTimeout } from './util.js';
 class Semaphore {
@@ -50,6 +50,18 @@ class Semaphore {
             next();
     }
 }
+const RECONNECT_BASE_MS = 1_000;
+const RECONNECT_MAX_MS = 30_000;
+/**
+ * Did the server ANSWER, with an error that is the caller's fault? Such errors
+ * (bad arguments, unknown method) prove the server is alive and must never
+ * count toward the circuit breaker — otherwise any key holding tools:call
+ * could trip the breaker for the whole fleet with five malformed calls.
+ */
+export function isClientFault(e) {
+    return (e instanceof McpError &&
+        (e.code === ErrorCode.InvalidParams || e.code === ErrorCode.MethodNotFound || e.code === ErrorCode.InvalidRequest || e.code === ErrorCode.ParseError));
+}
 export class DownstreamServer {
     cfg;
     hooks;
@@ -57,6 +69,9 @@ export class DownstreamServer {
     name;
     client;
     transport = null;
+    reconnectTimer = null;
+    reconnectAttempt = 0;
+    reconnects = 0;
     catalogs = { tools: [], resources: [], prompts: [] };
     semaphore;
     breakerState = 'closed';
@@ -74,7 +89,7 @@ export class DownstreamServer {
         this.hooks = hooks;
         this.transportOverride = transportOverride;
         this.name = cfg.name;
-        this.client = new Client({ name: 'mcpgateway', version: VERSION }, { capabilities: {} });
+        this.client = this.newClient();
         this.semaphore = new Semaphore(cfg.concurrency);
     }
     get inFlight() {
@@ -89,8 +104,87 @@ export class DownstreamServer {
     getCatalogs() {
         return this.catalogs;
     }
+    newClient() {
+        const client = new Client({ name: 'mcpgateway', version: VERSION }, { capabilities: {} });
+        client.onclose = () => this.handleClose(client);
+        return client;
+    }
+    nextTransport() {
+        const o = this.transportOverride;
+        if (o === undefined)
+            return this.createTransport();
+        return typeof o === 'function' ? o() : o;
+    }
+    /**
+     * The connection died underneath us (stdio child exited, socket closed).
+     * Open the breaker so callers fail fast, then reconnect with capped
+     * exponential backoff. Before this, a crashed stdio server stayed dead until
+     * the gateway was restarted.
+     */
+    handleClose(client) {
+        if (this.closed || client !== this.client)
+            return;
+        this.breakerState = 'open';
+        this.breakerOpenedAt = Date.now();
+        this.lastPingOk = false;
+        this.lastError = 'connection closed';
+        this.scheduleReconnect();
+    }
+    scheduleReconnect() {
+        if (this.closed || this.reconnectTimer !== null)
+            return;
+        const delay = Math.min(RECONNECT_BASE_MS * 2 ** this.reconnectAttempt, RECONNECT_MAX_MS);
+        this.reconnectAttempt += 1;
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null;
+            void this.reconnect();
+        }, delay);
+        this.reconnectTimer.unref?.();
+    }
+    async reconnect() {
+        if (this.closed)
+            return;
+        const old = this.client;
+        old.onclose = undefined;
+        try {
+            await old.close();
+        }
+        catch {
+            /* already gone */
+        }
+        if (this.closed)
+            return;
+        const client = this.newClient();
+        this.client = client;
+        try {
+            const transport = this.nextTransport();
+            this.transport = transport;
+            await withTimeout(client.connect(transport), 30_000, `reconnect to server "${this.name}"`);
+            this.registerCatalogWatchers();
+            await this.refreshCatalogs(false);
+            this.breakerState = 'closed';
+            this.consecutiveFailures = 0;
+            this.lastPingOk = true;
+            this.lastError = null;
+            this.reconnectAttempt = 0;
+            this.reconnects += 1;
+            this.hooks.onReconnected?.(this);
+            this.hooks.onCatalogChanged(this);
+        }
+        catch (e) {
+            this.lastError = e.message;
+            client.onclose = undefined;
+            await client.close().catch(() => undefined);
+            this.client = this.newClient();
+            this.scheduleReconnect();
+        }
+    }
+    /** Re-fetch every catalog from the live server (admin reload). */
+    async refresh() {
+        await this.refreshCatalogs(false);
+    }
     async connect() {
-        const transport = this.transportOverride ?? this.createTransport();
+        const transport = this.nextTransport();
         this.transport = transport;
         // If the server binary is missing or hangs, fail fast instead of hanging serve.
         await withTimeout(this.client.connect(transport), 30_000, `connect to server "${this.name}"`);
@@ -200,7 +294,7 @@ export class DownstreamServer {
             return result;
         }
         catch (e) {
-            this.onFailure();
+            this.onFailure(e);
             throw e;
         }
         finally {
@@ -226,7 +320,7 @@ export class DownstreamServer {
             return result;
         }
         catch (e) {
-            this.onFailure();
+            this.onFailure(e);
             throw e;
         }
         finally {
@@ -246,14 +340,20 @@ export class DownstreamServer {
             return result;
         }
         catch (e) {
-            this.onFailure();
+            this.onFailure(e);
             throw e;
         }
         finally {
             release();
         }
     }
-    onFailure() {
+    onFailure(e) {
+        if (isClientFault(e)) {
+            // The server answered; it is alive. Don't count it, and let a half-open
+            // probe close the breaker.
+            this.onSuccess();
+            return;
+        }
         this.consecutiveFailures += 1;
         if (this.breakerState === 'half-open' || this.consecutiveFailures >= this.cfg.failureThreshold) {
             this.breakerState = 'open';
@@ -266,6 +366,8 @@ export class DownstreamServer {
             clearInterval(this.healthTimer);
         if (this.refreshTimer)
             clearTimeout(this.refreshTimer);
+        if (this.reconnectTimer)
+            clearTimeout(this.reconnectTimer);
         try {
             await this.client.close();
         }

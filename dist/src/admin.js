@@ -10,7 +10,7 @@
  *   POST /v1/reload     — refresh all downstream catalogs (admin scope)
  */
 import { createServer as createHttpServer } from 'node:http';
-import { timingSafeEqual } from 'node:crypto';
+import { matchKey } from './util.js';
 import { VERSION } from './version.js';
 function authenticate(req, auth) {
     if (auth.disabled)
@@ -19,12 +19,8 @@ function authenticate(req, auth) {
     if (typeof header !== 'string' || !header.startsWith('Bearer '))
         return null;
     const presented = header.slice('Bearer '.length);
-    for (const k of auth.keys) {
-        if (presented.length === k.key.length && timingSafeEqual(Buffer.from(presented), Buffer.from(k.key))) {
-            return { keyId: k.id, scopes: k.scopes };
-        }
-    }
-    return null;
+    const k = matchKey(auth.keys, presented);
+    return k === null ? null : { keyId: k.id, scopes: k.scopes };
 }
 function json(res, code, body) {
     res.writeHead(code, { 'content-type': 'application/json' });
@@ -74,6 +70,10 @@ async function handle(req, res, deps) {
             json(res, 403, { error: `key "${authed.keyId}" lacks scope "admin"` });
             return;
         }
+        // server_up was set once at startup; refresh it from live health so the
+        // gauge actually tracks outages.
+        for (const s of deps.getServers())
+            deps.metrics.serverUp.set({ server: s.name }, s.healthy ? 1 : 0);
         res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4' });
         res.end(deps.metrics.render());
         return;
@@ -115,6 +115,30 @@ async function handle(req, res, deps) {
         }
         await deps.reloadCatalogs();
         json(res, 200, { ok: true });
+        return;
+    }
+    if (req.method === 'GET' && path === '/v1/audit/head') {
+        if (!isAdmin) {
+            json(res, 403, { error: `key "${authed.keyId}" lacks scope "admin"` });
+            return;
+        }
+        // Store this value somewhere the gateway host cannot rewrite; it is the
+        // only defense against truncation of the newest records.
+        json(res, 200, deps.audit.head());
+        return;
+    }
+    if (req.method === 'GET' && path === '/v1/pins') {
+        json(res, 200, { violations: deps.pins?.violations() ?? [] });
+        return;
+    }
+    if (req.method === 'POST' && path === '/v1/pins/accept') {
+        if (!isAdmin) {
+            json(res, 403, { error: `key "${authed.keyId}" lacks scope "admin"` });
+            return;
+        }
+        const tool = url.searchParams.get('tool') ?? undefined;
+        const accepted = deps.pins?.accept(tool) ?? [];
+        json(res, 200, { accepted });
         return;
     }
     json(res, 404, { error: 'not found' });

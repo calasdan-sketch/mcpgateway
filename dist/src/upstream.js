@@ -17,14 +17,14 @@
  * and rate limits apply to tools in v1 (blueprint D2).
  */
 import { createServer as createHttpServer } from 'node:http';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, GetPromptRequestSchema, ListPromptsRequestSchema, ListResourcesRequestSchema, ListToolsRequestSchema, McpError, ReadResourceRequestSchema, ErrorCode, } from '@modelcontextprotocol/sdk/types.js';
 import { collectSecretValues, redactSecretValues } from './audit.js';
 import { checkResponse, checkToolCall, isHidden } from './policy.js';
-import { newRequestId, safeJsonStringify, truncate } from './util.js';
+import { globMatch, matchKey, newRequestId, safeJsonStringify, truncate } from './util.js';
 import { VERSION } from './version.js';
 export const RESOURCE_SCHEME = 'mcpgateway';
 export function publicResourceUri(server, originalUri) {
@@ -45,6 +45,59 @@ export function parsePublicResourceUri(publicUri) {
         return null;
     }
 }
+/** Already audited; the catch blocks must not audit it a second time. */
+class PolicyBlockError extends McpError {
+    constructor(message) {
+        super(-32000, message);
+    }
+}
+export const META_SEARCH = 'gateway_search_tools';
+export const META_CALL = 'gateway_call_tool';
+const SESSION_IDLE_MS = 30 * 60 * 1000;
+const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '[::1]', '::1'];
+/** Hostname part of a Host header or URL host (port stripped, IPv6 brackets kept). */
+export function hostnameOf(hostHeader) {
+    const h = hostHeader.trim().toLowerCase();
+    if (h.startsWith('[')) {
+        const end = h.indexOf(']');
+        return end === -1 ? h : h.slice(0, end + 1);
+    }
+    const colon = h.lastIndexOf(':');
+    return colon === -1 ? h : h.slice(0, colon);
+}
+/**
+ * DNS-rebinding / cross-origin check required by the MCP Streamable HTTP spec.
+ * Returns an error string or null. Without configuration it protects loopback
+ * binds (the case where a browser on the same machine is the threat); a public
+ * bind needs allowedHosts/allowedOrigins to be set to be checked.
+ */
+export function checkHostOrigin(cfg, hostHeader, originHeader) {
+    const bindIsLoopback = LOOPBACK_HOSTS.includes(cfg.host.toLowerCase()) || cfg.host.toLowerCase().endsWith('.localhost');
+    const hosts = cfg.allowedHosts.length > 0 ? cfg.allowedHosts.map(hostnameOf) : bindIsLoopback ? LOOPBACK_HOSTS : [];
+    if (hosts.length > 0) {
+        if (hostHeader === undefined || !hosts.includes(hostnameOf(hostHeader)))
+            return 'host header not allowed';
+    }
+    if (originHeader !== undefined) {
+        const origin = originHeader.toLowerCase();
+        if (cfg.allowedOrigins.length > 0) {
+            if (!cfg.allowedOrigins.includes(origin))
+                return 'origin not allowed';
+        }
+        else if (hosts.length > 0) {
+            let originHost;
+            try {
+                originHost = hostnameOf(new URL(origin).host);
+            }
+            catch {
+                return 'origin not allowed';
+            }
+            if (!hosts.includes(originHost))
+                return 'origin not allowed';
+        }
+    }
+    return null;
+}
 // ---------------------------------------------------------------------------
 // Gateway
 // ---------------------------------------------------------------------------
@@ -59,11 +112,18 @@ export class GatewayUpstream {
     /** Create the agent-facing MCP server. Handlers always read the CURRENT routing table. */
     createMcpServer() {
         const server = new Server({ name: 'mcpgateway', version: VERSION }, { capabilities: { tools: {}, resources: {}, prompts: {} } });
+        const ctxOf = () => sessionContext.get(server) ?? { sessionId: 'stdio', keyId: undefined };
         server.setRequestHandler(ListToolsRequestSchema, async () => {
             const table = this.deps.getTable();
+            const keyId = ctxOf().keyId;
             const tools = [];
+            if (this.deps.exposure?.mode === 'search') {
+                tools.push(...metaTools());
+            }
             for (const entry of table.toolMeta.values()) {
-                if (isHidden(this.deps.policy, entry.publicName))
+                if (this.visibleTo(keyId, entry.publicName) === false)
+                    continue;
+                if (this.deps.exposure?.mode === 'search' && !this.deps.exposure.alwaysExpose.some((g) => globMatch(g, entry.publicName)))
                     continue;
                 tools.push({
                     name: entry.publicName,
@@ -73,10 +133,24 @@ export class GatewayUpstream {
             }
             return { tools };
         });
-        const ctxOf = () => sessionContext.get(server) ?? { sessionId: 'stdio', keyId: undefined };
         server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const name = request.params.name;
             const args = request.params.arguments ?? {};
+            if (this.deps.exposure?.mode === 'search') {
+                if (name === META_SEARCH)
+                    return this.handleSearch(args, ctxOf());
+                if (name === META_CALL) {
+                    const a = args;
+                    if (typeof a.name !== 'string' || a.name.length === 0)
+                        throw new McpError(ErrorCode.InvalidParams, `${META_CALL} needs a string "name"`);
+                    if (a.name === META_CALL || a.name === META_SEARCH)
+                        throw new McpError(ErrorCode.InvalidParams, 'meta-tools cannot call themselves');
+                    if (a.arguments !== undefined && (a.arguments === null || typeof a.arguments !== 'object' || Array.isArray(a.arguments))) {
+                        throw new McpError(ErrorCode.InvalidParams, `${META_CALL} "arguments" must be an object`);
+                    }
+                    return this.handleToolCall(a.name, a.arguments ?? {}, ctxOf());
+                }
+            }
             return this.handleToolCall(name, args, ctxOf());
         });
         server.setRequestHandler(ListResourcesRequestSchema, async () => {
@@ -130,6 +204,13 @@ export class GatewayUpstream {
             res.end(JSON.stringify({ error: 'not found (MCP endpoint is POST /mcp)' }));
             return;
         }
+        // DNS-rebinding / cross-origin defense (MCP spec: servers MUST validate Origin).
+        const hostProblem = checkHostOrigin(this.deps.http ?? { host: '127.0.0.1', allowedHosts: [], allowedOrigins: [] }, req.headers['host'], typeof req.headers['origin'] === 'string' ? req.headers['origin'] : undefined);
+        if (hostProblem !== null) {
+            res.writeHead(403, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: hostProblem }));
+            return;
+        }
         // Edge auth for every HTTP request (GET/POST/DELETE alike).
         const authed = this.authenticateHttp(req);
         if (authed === null) {
@@ -138,10 +219,17 @@ export class GatewayUpstream {
             return;
         }
         if (req.method === 'POST') {
-            const body = await readBody(req, res);
-            if (body === null)
+            const parsedBody = await readBody(req, res);
+            if (parsedBody === FAILED)
                 return; // error already written
-            const methods = Array.isArray(body) ? body.map((m) => m.method) : [body.method];
+            const body = parsedBody;
+            const items = Array.isArray(body) ? body : [body];
+            if (items.length === 0 || items.some((m) => m === null || typeof m !== 'object' || Array.isArray(m))) {
+                res.writeHead(400, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ error: 'body must be a JSON-RPC message or a non-empty array of them' }));
+                return;
+            }
+            const methods = items.map((m) => m.method);
             for (const method of methods) {
                 const scope = scopeForMethod(typeof method === 'string' ? method : '');
                 if (scope !== null && !authed.scopes.includes(scope)) {
@@ -151,7 +239,16 @@ export class GatewayUpstream {
                 }
             }
             const sessionId = req.headers['mcp-session-id'];
-            let transport = sessionId !== undefined ? sessions.get(sessionId) : undefined;
+            const existing = sessionId !== undefined ? sessions.get(sessionId) : undefined;
+            if (existing !== undefined && existing.keyId !== authed.keyId) {
+                // A session belongs to the key that opened it.
+                res.writeHead(403, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ error: 'session belongs to a different key' }));
+                return;
+            }
+            if (existing !== undefined)
+                existing.lastSeen = Date.now();
+            let transport = existing?.transport;
             if (transport === undefined) {
                 if (sessionId !== undefined) {
                     res.writeHead(400, { 'content-type': 'application/json' });
@@ -160,7 +257,12 @@ export class GatewayUpstream {
                 }
                 // Bound the session table: clients that never DELETE would otherwise
                 // grow it without limit.
-                if (sessions.size >= this.deps.httpMaxSessions) {
+                // Abandoned sessions expire, and no single key may hold more than half
+                // the table (otherwise one key could lock every other agent out).
+                await this.sweepSessions(sessions);
+                const perKeyCap = Math.max(1, Math.floor(this.deps.httpMaxSessions / 2));
+                const mine = [...sessions.values()].filter((x) => x.keyId === authed.keyId).length;
+                if (sessions.size >= this.deps.httpMaxSessions || mine >= perKeyCap) {
                     res.writeHead(429, { 'content-type': 'application/json' });
                     res.end(JSON.stringify({ error: 'too many sessions' }));
                     return;
@@ -169,7 +271,7 @@ export class GatewayUpstream {
                 const newTransport = new StreamableHTTPServerTransport({
                     sessionIdGenerator: () => randomUUID(),
                     onsessioninitialized: (id) => {
-                        sessions.set(id, newTransport);
+                        sessions.set(id, { transport: newTransport, keyId: authed.keyId, lastSeen: Date.now() });
                         // Real session id for audit records on this session's calls.
                         sessionContext.set(server, { sessionId: id, keyId: authed.keyId });
                     },
@@ -185,17 +287,105 @@ export class GatewayUpstream {
         }
         if (req.method === 'GET' || req.method === 'DELETE') {
             const sessionId = req.headers['mcp-session-id'];
-            const transport = sessionId !== undefined ? sessions.get(sessionId) : undefined;
-            if (transport === undefined) {
+            const entry = sessionId !== undefined ? sessions.get(sessionId) : undefined;
+            if (entry === undefined) {
                 res.writeHead(400, { 'content-type': 'application/json' });
                 res.end(JSON.stringify({ error: 'unknown mcp-session-id' }));
                 return;
             }
-            await transport.handleRequest(req, res);
+            if (entry.keyId !== authed.keyId) {
+                res.writeHead(403, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ error: 'session belongs to a different key' }));
+                return;
+            }
+            entry.lastSeen = Date.now();
+            await entry.transport.handleRequest(req, res);
             return;
         }
         res.writeHead(405, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'method not allowed' }));
+    }
+    async sweepSessions(sessions) {
+        const ttl = this.deps.http?.sessionIdleMs ?? SESSION_IDLE_MS;
+        const now = Date.now();
+        for (const [id, s] of [...sessions]) {
+            if (now - s.lastSeen > ttl) {
+                sessions.delete(id);
+                await s.transport.close().catch(() => undefined);
+            }
+        }
+    }
+    // -- per-key access --------------------------------------------------------------
+    keyOf(keyId) {
+        return keyId === undefined ? undefined : this.deps.auth.keys.find((k) => k.id === keyId);
+    }
+    /** May this key see/call this public tool? (no key = stdio/anonymous = unrestricted here) */
+    visibleTo(keyId, publicName) {
+        if (isHidden(this.deps.policy, publicName))
+            return false;
+        const k = this.keyOf(keyId);
+        if (k === undefined)
+            return true;
+        if (k.denyTools?.some((g) => globMatch(g, publicName)))
+            return false;
+        if (k.allowTools !== undefined && !k.allowTools.some((g) => globMatch(g, publicName)))
+            return false;
+        return true;
+    }
+    /** Per-key budget across all tools/resources/prompts. true = allowed. */
+    keyBudgetOk(keyId) {
+        const k = this.keyOf(keyId);
+        if (k?.rateLimit === undefined)
+            return true;
+        return this.deps.rateLimiter.tryAcquire(`key\0${k.id}`, k.rateLimit);
+    }
+    // -- search meta-tool ------------------------------------------------------------
+    handleSearch(args, ctx) {
+        const a = (args ?? {});
+        if (typeof a.query !== 'string' || a.query.length === 0 || a.query.length > 500) {
+            throw new McpError(ErrorCode.InvalidParams, `${META_SEARCH} needs a "query" string (1-500 chars)`);
+        }
+        const limit = typeof a.limit === 'number' && Number.isFinite(a.limit) ? Math.min(25, Math.max(1, Math.floor(a.limit))) : 8;
+        if (!this.keyBudgetOk(ctx.keyId))
+            throw new McpError(-32000, 'rate limit exceeded for this key', { retryable: true });
+        const tokens = a.query.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 0).slice(0, 20);
+        const scored = [];
+        for (const entry of this.deps.getTable().toolMeta.values()) {
+            if (!this.visibleTo(ctx.keyId, entry.publicName))
+                continue;
+            const name = entry.publicName.toLowerCase();
+            const desc = (entry.description ?? '').toLowerCase();
+            let score = 0;
+            for (const t of tokens) {
+                if (name === t)
+                    score += 6;
+                else if (name.includes(t))
+                    score += 3;
+                if (desc.includes(t))
+                    score += 1;
+            }
+            if (score > 0)
+                scored.push({ score, entry });
+        }
+        scored.sort((x, y) => y.score - x.score || (x.entry.publicName < y.entry.publicName ? -1 : 1));
+        const results = scored.slice(0, limit).map(({ entry }) => ({
+            name: entry.publicName,
+            description: entry.description,
+            inputSchema: entry.inputSchema ?? { type: 'object' },
+        }));
+        this.deps.audit.log({
+            ts: new Date().toISOString(),
+            reqId: newRequestId(),
+            sessionId: ctx.sessionId,
+            keyId: ctx.keyId,
+            tool: META_SEARCH,
+            server: 'gateway',
+            originalTool: META_SEARCH,
+            durationMs: 0,
+            status: 'ok',
+            args,
+        });
+        return { content: [{ type: 'text', text: JSON.stringify({ matches: results, total: scored.length }) }] };
     }
     // -- authentication ------------------------------------------------------------
     /** Bearer auth for the HTTP upstream. Returns null when rejected. */
@@ -206,12 +396,8 @@ export class GatewayUpstream {
         if (typeof header !== 'string' || !header.startsWith('Bearer '))
             return null;
         const presented = header.slice('Bearer '.length);
-        for (const k of this.deps.auth.keys) {
-            if (presented.length === k.key.length && timingSafeEqual(Buffer.from(presented), Buffer.from(k.key))) {
-                return { keyId: k.id, scopes: k.scopes };
-            }
-        }
-        return null;
+        const k = matchKey(this.deps.auth.keys, presented);
+        return k === null ? null : { keyId: k.id, scopes: k.scopes };
     }
     // -- tool call pipeline ----------------------------------------------------------
     async handleToolCall(publicName, args, ctx) {
@@ -270,6 +456,13 @@ export class GatewayUpstream {
             finish('denied', { policyReason: 'hidden', errorMessage: `tool "${publicName}" is hidden by policy` });
             throw new McpError(ErrorCode.InvalidParams, `unknown tool "${truncateName(publicName)}"`);
         }
+        // 2b. Per-key ACL: a key that may not see a tool gets the same masked
+        // "unknown tool" error as for a hidden one.
+        if (!this.visibleTo(ctx.keyId, publicName)) {
+            metrics.policyDenials.inc({ tool: publicName, reason: 'key_acl' });
+            finish('denied', { policyReason: 'key_acl', errorMessage: `tool "${publicName}" is not permitted for key "${ctx.keyId ?? ''}"` });
+            throw new McpError(ErrorCode.InvalidParams, `unknown tool "${truncateName(publicName)}"`);
+        }
         // 3. Fleet policy.
         const verdict = checkToolCall(this.deps.policy, publicName, args);
         if (verdict.decision === 'deny' && this.deps.policy.mode === 'enforce') {
@@ -278,7 +471,12 @@ export class GatewayUpstream {
             throw new McpError(-32000, `tool call denied by policy: ${verdict.detail}`, { reason: verdict.reason });
         }
         const wouldDeny = verdict.decision === 'deny' ? verdict.reason : undefined;
-        // 3. Rate limit.
+        // 3. Rate limit: per-key budget first (so one agent cannot starve the rest), then per-tool.
+        if (!this.keyBudgetOk(ctx.keyId)) {
+            metrics.rateLimitHits.inc({ tool: publicName });
+            finish('rate_limited', { errorMessage: `key "${ctx.keyId ?? ''}" exceeded its rate limit` });
+            throw new McpError(-32000, 'rate limit exceeded for this key', { retryable: true });
+        }
         const rule = this.deps.perToolRateLimits[publicName] ?? this.deps.defaultRateLimit;
         if (!this.deps.rateLimiter.tryAcquire(publicName, rule)) {
             metrics.rateLimitHits.inc({ tool: publicName });
@@ -309,7 +507,8 @@ export class GatewayUpstream {
             // 5b. Result-size guard: a malicious or buggy server must not OOM the
             // gateway with a giant payload. (Servers are operator-trusted, but
             // bugs happen; fail the call, not the process.)
-            const resultSize = safeJsonStringify(result).length;
+            const resultJson = safeJsonStringify(result);
+            const resultSize = resultJson.length;
             if (resultSize > this.deps.maxResultChars) {
                 finish('error', {
                     policyReason: wouldDeny !== undefined ? `would_deny:${wouldDeny}` : undefined,
@@ -320,7 +519,7 @@ export class GatewayUpstream {
                 throw new McpError(-32000, `tool result exceeded the ${this.deps.maxResultChars}-char limit`, { retryable: false });
             }
             // 6. Response egress rules (structured redaction — never breaks JSON).
-            const checked = checkResponse(this.deps.policy, result);
+            const checked = checkResponse(this.deps.policy, result, resultJson);
             if (checked.action === 'block') {
                 finish('blocked', {
                     policyReason: wouldDeny !== undefined ? `would_deny:${wouldDeny}` : undefined,
@@ -338,7 +537,7 @@ export class GatewayUpstream {
         catch (e) {
             if (e instanceof McpError && alreadyAudited)
                 throw e;
-            const message = e instanceof Error ? e.message : String(e);
+            const message = (e instanceof Error ? e.message : String(e)).replace(/^(MCP error -?\d+: )+/, '');
             const scrubbed = scrub(message);
             const timedOut = /timed out/i.test(scrubbed);
             // Preserve the downstream JSON-RPC code when there is one (more
@@ -367,8 +566,28 @@ export class GatewayUpstream {
         if (target === undefined || parsed === null) {
             throw new McpError(ErrorCode.InvalidParams, `unknown resource "${truncateName(publicUri)}"`);
         }
+        if (!this.keyBudgetOk(ctx.keyId))
+            throw new McpError(-32000, 'rate limit exceeded for this key', { retryable: true });
         try {
-            const result = await target.server.readResource(parsed.originalUri);
+            const raw = await target.server.readResource(parsed.originalUri);
+            // Egress rules apply to resources exactly as to tool results.
+            const checked = checkResponse(this.deps.policy, raw);
+            if (checked.action === 'block') {
+                this.deps.audit.log({
+                    ts: new Date().toISOString(),
+                    reqId,
+                    sessionId: ctx.sessionId,
+                    keyId: ctx.keyId,
+                    tool: `resource:${publicUri}`,
+                    server: target.server.name,
+                    originalTool: parsed.originalUri,
+                    durationMs: Date.now() - t0,
+                    status: 'blocked',
+                    errorMessage: 'resource blocked by policy response rules',
+                });
+                throw new PolicyBlockError('resource blocked by policy');
+            }
+            const result = checked.result;
             this.deps.audit.log({
                 ts: new Date().toISOString(),
                 reqId,
@@ -379,10 +598,13 @@ export class GatewayUpstream {
                 originalTool: parsed.originalUri,
                 durationMs: Date.now() - t0,
                 status: 'ok',
+                redactions: checked.redactions || undefined,
             });
             return result;
         }
         catch (e) {
+            if (e instanceof PolicyBlockError)
+                throw e;
             const message = e instanceof Error ? e.message : String(e);
             this.deps.audit.log({
                 ts: new Date().toISOString(),
@@ -408,8 +630,28 @@ export class GatewayUpstream {
         if (target === undefined) {
             throw new McpError(ErrorCode.InvalidParams, `unknown prompt "${truncateName(publicName)}"`);
         }
+        if (!this.keyBudgetOk(ctx.keyId))
+            throw new McpError(-32000, 'rate limit exceeded for this key', { retryable: true });
         try {
-            const result = await target.server.getPrompt(target.original, args);
+            const raw = await target.server.getPrompt(target.original, args);
+            const checked = checkResponse(this.deps.policy, raw);
+            if (checked.action === 'block') {
+                this.deps.audit.log({
+                    ts: new Date().toISOString(),
+                    reqId,
+                    sessionId: ctx.sessionId,
+                    keyId: ctx.keyId,
+                    tool: `prompt:${publicName}`,
+                    server: target.server.name,
+                    originalTool: target.original,
+                    durationMs: Date.now() - t0,
+                    status: 'blocked',
+                    errorMessage: 'prompt blocked by policy response rules',
+                    args,
+                });
+                throw new PolicyBlockError('prompt blocked by policy');
+            }
+            const result = checked.result;
             this.deps.audit.log({
                 ts: new Date().toISOString(),
                 reqId,
@@ -421,10 +663,13 @@ export class GatewayUpstream {
                 durationMs: Date.now() - t0,
                 status: 'ok',
                 args,
+                redactions: checked.redactions || undefined,
             });
             return result;
         }
         catch (e) {
+            if (e instanceof PolicyBlockError)
+                throw e;
             const message = e instanceof Error ? e.message : String(e);
             this.deps.audit.log({
                 ts: new Date().toISOString(),
@@ -461,9 +706,33 @@ export function scopeForMethod(method) {
         return 'prompts:*';
     return null; // initialize, ping, notifications, completion — any authed key
 }
+function metaTools() {
+    return [
+        {
+            name: META_SEARCH,
+            description: 'Find tools by keyword. Returns matching tool names, descriptions and input schemas. Call this first, then call a match with gateway_call_tool.',
+            inputSchema: {
+                type: 'object',
+                properties: { query: { type: 'string', description: 'keywords, e.g. "create issue"' }, limit: { type: 'number', description: 'max results (default 8, max 25)' } },
+                required: ['query'],
+            },
+        },
+        {
+            name: META_CALL,
+            description: 'Call any tool found with gateway_search_tools. Fleet policy, rate limits and audit apply exactly as for a direct call.',
+            inputSchema: {
+                type: 'object',
+                properties: { name: { type: 'string', description: 'tool name from search results' }, arguments: { type: 'object', description: 'arguments for that tool' } },
+                required: ['name'],
+            },
+        },
+    ];
+}
 function truncateName(name) {
     return name.length > 120 ? name.slice(0, 120) + '…' : name;
 }
+/** Sentinel: JSON `null` is a valid body, so failure needs its own marker (a bare null used to leave the request hanging). */
+const FAILED = Symbol('body-failed');
 function readBody(req, res) {
     return new Promise((resolve) => {
         const chunks = [];
@@ -477,7 +746,7 @@ function readBody(req, res) {
                 res.writeHead(code, { 'content-type': 'application/json' });
                 res.end(JSON.stringify({ error }));
             }
-            resolve(null);
+            resolve(FAILED);
         };
         req.on('data', (chunk) => {
             size += chunk.length;
@@ -497,7 +766,6 @@ function readBody(req, res) {
             }
             catch {
                 fail(400, 'invalid JSON body');
-                resolve(null);
             }
         });
         req.on('error', () => fail(400, 'error reading body'));

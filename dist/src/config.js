@@ -98,6 +98,17 @@ function strMap(raw, key, ctx, problems) {
     }
     return v;
 }
+/** Unknown keys in a section: error for security-bearing sections (a typo must not silently disable a rule), warning elsewhere. */
+function checkKnown(raw, known, where, fatal, p) {
+    const bad = Object.keys(raw).filter((k) => !known.includes(k));
+    if (bad.length === 0)
+        return;
+    const hint = bad.map((k) => {
+        const near = known.find((n) => n.toLowerCase() === k.toLowerCase() || n.toLowerCase() === k.toLowerCase() + 's' || n.toLowerCase() + 's' === k.toLowerCase());
+        return near ? `"${k}" (did you mean "${near}"?)` : `"${k}"`;
+    });
+    p.push(fatal ? `${where}: unknown key(s) ${hint.join(', ')}` : `${where}: WARNING: unknown key(s) ignored: ${hint.join(', ')}`);
+}
 function rateLimit(raw, ctx, problems) {
     if (!isRaw(raw)) {
         problems.push(`${ctx}: rate limit must be {rps, burst}`);
@@ -313,10 +324,36 @@ export function validateConfig(raw, source, opts = {}) {
         responseBlock: strArray(polRaw, 'responseBlock', ctx('policy'), p),
         responseWarn: strArray(polRaw, 'responseWarn', ctx('policy'), p),
         scanWindowChars: optNum(polRaw, 'scanWindowChars', ctx('policy'), 65536, 1024, p),
+        pinning: { mode: 'off' },
     };
     if (policy.mode !== 'enforce' && policy.mode !== 'observe') {
         p.push(ctx('policy.mode must be enforce|observe'));
         policy.mode = 'enforce';
+    }
+    checkKnown(polRaw, ['mode', 'allowTools', 'denyTools', 'hideTools', 'argRules', 'responseRedact', 'responseBlock', 'responseWarn', 'scanWindowChars', 'pinning'], ctx('policy'), true, p);
+    const pinning = { mode: 'off' };
+    policy.pinning = pinning;
+    const pinRaw = polRaw['pinning'];
+    if (pinRaw !== undefined) {
+        if (!isRaw(pinRaw))
+            p.push(ctx('policy.pinning must be {mode, file?}'));
+        else {
+            checkKnown(pinRaw, ['mode', 'file'], ctx('policy.pinning'), true, p);
+            const m = pinRaw['mode'];
+            if (m !== 'off' && m !== 'warn' && m !== 'block')
+                p.push(ctx('policy.pinning.mode must be off|warn|block'));
+            else
+                pinning.mode = m;
+            if (pinRaw['file'] !== undefined) {
+                if (!str(pinRaw['file']) || pinRaw['file'].length === 0)
+                    p.push(ctx('policy.pinning.file must be a non-empty string'));
+                else
+                    pinning.file = pinRaw['file'];
+            }
+            if (pinning.mode === 'block' && pinning.file === undefined) {
+                p.push(ctx('policy.pinning.mode "block" needs policy.pinning.file (in-memory pins would re-trust a malicious change on every restart)'));
+            }
+        }
     }
     if (policy.allowTools.length === 0)
         policy.allowTools = ['*'];
@@ -348,6 +385,7 @@ export function validateConfig(raw, source, opts = {}) {
     // but catch typos like unbalanced intent early is unnecessary; skip)
     // ---- auth ----
     const authRaw = isRaw(raw['auth']) ? raw['auth'] : {};
+    checkKnown(authRaw, ['disabled', 'keys'], ctx('auth'), true, p);
     const authDisabled = authRaw['disabled'] === true;
     const keys = [];
     const keysRaw = authRaw['keys'];
@@ -362,8 +400,12 @@ export function validateConfig(raw, source, opts = {}) {
                     p.push(`${kc}: must be a mapping`);
                     return;
                 }
+                checkKnown(k, ['id', 'key', 'scopes', 'allowTools', 'denyTools', 'rateLimit'], kc, true, p);
                 const id = reqStr(k, 'id', kc, p);
                 const key = reqStr(k, 'key', kc, p);
+                const keyAllow = k['allowTools'] === undefined ? undefined : strArray(k, 'allowTools', kc, p);
+                const keyDeny = k['denyTools'] === undefined ? undefined : strArray(k, 'denyTools', kc, p);
+                const keyRate = k['rateLimit'] === undefined ? undefined : rateLimit(k['rateLimit'], `${kc}.rateLimit`, p);
                 if (id && seenIds.has(id))
                     p.push(`${kc}: duplicate key id "${id}"`);
                 if (id)
@@ -385,7 +427,14 @@ export function validateConfig(raw, source, opts = {}) {
                 if (id && key) {
                     if (key.length < 16)
                         p.push(`${kc}: key is shorter than 16 chars — use a long random secret`);
-                    keys.push({ id, key, scopes });
+                    const entry = { id, key, scopes };
+                    if (keyAllow !== undefined)
+                        entry.allowTools = keyAllow;
+                    if (keyDeny !== undefined)
+                        entry.denyTools = keyDeny;
+                    if (keyRate !== undefined)
+                        entry.rateLimit = keyRate;
+                    keys.push(entry);
                 }
             });
         }
@@ -402,7 +451,23 @@ export function validateConfig(raw, source, opts = {}) {
         maxArgsChars: 8192,
         maxSizeMB: 100,
         keepFiles: 5,
+        chain: false,
     };
+    checkKnown(audRaw, ['path', 'logArgs', 'redactKeys', 'maxArgsChars', 'maxSizeMB', 'keepFiles', 'chain', 'chainKey'], ctx('audit'), false, p);
+    if (audRaw['chain'] !== undefined) {
+        if (typeof audRaw['chain'] !== 'boolean')
+            p.push(ctx('audit.chain must be boolean'));
+        else
+            audit.chain = audRaw['chain'];
+    }
+    if (audRaw['chainKey'] !== undefined) {
+        if (!str(audRaw['chainKey']) || audRaw['chainKey'].length < 16)
+            p.push(ctx('audit.chainKey must be a string of at least 16 chars'));
+        else
+            audit.chainKey = audRaw['chainKey'];
+    }
+    if (audit.chainKey !== undefined && !audit.chain)
+        p.push(ctx('audit.chainKey is set but audit.chain is not true'));
     if (audRaw['path'] !== undefined) {
         if (!str(audRaw['path']))
             p.push(ctx('audit.path must be a string'));
@@ -461,7 +526,7 @@ export function validateConfig(raw, source, opts = {}) {
     const httpRaw = isRaw(upRaw['http']) ? upRaw['http'] : {};
     const upstream = {
         stdio: { enabled: stdioRaw['enabled'] !== undefined ? stdioRaw['enabled'] === true : true },
-        http: { enabled: false, host: '127.0.0.1', port: 3000, maxSessions: 128 },
+        http: { enabled: false, host: '127.0.0.1', port: 3000, maxSessions: 128, allowedHosts: [], allowedOrigins: [] },
     };
     if (typeof stdioRaw['enabled'] !== 'undefined' && typeof stdioRaw['enabled'] !== 'boolean') {
         p.push(ctx('upstream.stdio.enabled must be boolean'));
@@ -480,15 +545,28 @@ export function validateConfig(raw, source, opts = {}) {
     }
     upstream.http.port = optNum(httpRaw, 'port', ctx('upstream.http'), 3000, 0, p);
     upstream.http.maxSessions = optNum(httpRaw, 'maxSessions', ctx('upstream.http'), 128, 1, p);
+    checkKnown(httpRaw, ['enabled', 'host', 'port', 'maxSessions', 'allowedHosts', 'allowedOrigins'], ctx('upstream.http'), false, p);
+    upstream.http.allowedHosts = strArray(httpRaw, 'allowedHosts', ctx('upstream.http'), p).map((h) => h.toLowerCase());
+    upstream.http.allowedOrigins = strArray(httpRaw, 'allowedOrigins', ctx('upstream.http'), p).map((o) => o.toLowerCase());
     if (!upstream.stdio.enabled && !upstream.http.enabled) {
         p.push(ctx('at least one upstream transport (stdio or http) must be enabled'));
+    }
+    // ---- exposure ----
+    const expRaw = isRaw(raw['exposure']) ? raw['exposure'] : {};
+    checkKnown(expRaw, ['mode', 'alwaysExpose'], ctx('exposure'), true, p);
+    const exposure = { mode: 'full', alwaysExpose: strArray(expRaw, 'alwaysExpose', ctx('exposure'), p) };
+    if (expRaw['mode'] !== undefined) {
+        if (expRaw['mode'] !== 'full' && expRaw['mode'] !== 'search')
+            p.push(ctx('exposure.mode must be full|search'));
+        else
+            exposure.mode = expRaw['mode'];
     }
     // ---- global limits ----
     const globalMaxInflight = optNum(raw, 'globalMaxInflight', source, 256, 1, p);
     const maxResultChars = optNum(raw, 'maxResultChars', source, 10_000_000, 1024, p);
     // unknown top-level keys: warn via problems? Panel said warn, not fail.
     // We surface them as warnings through the returned config instead.
-    const knownTop = new Set(['gateway', 'servers', 'namespace', 'rateLimits', 'policy', 'auth', 'audit', 'admin', 'upstream', 'globalMaxInflight', 'maxResultChars']);
+    const knownTop = new Set(['gateway', 'servers', 'namespace', 'rateLimits', 'policy', 'auth', 'audit', 'admin', 'upstream', 'exposure', 'globalMaxInflight', 'maxResultChars']);
     const unknownTop = Object.keys(raw).filter((k) => !knownTop.has(k));
     if (unknownTop.length > 0) {
         // non-fatal: attach to stderr at serve time via a thrown-adjacent channel.
@@ -511,6 +589,7 @@ export function validateConfig(raw, source, opts = {}) {
         audit,
         admin,
         upstream,
+        exposure,
         globalMaxInflight,
         maxResultChars,
     };

@@ -58,8 +58,13 @@ export function checkToolCall(policy, publicToolName, args) {
  * produce invalid JSON (scrutiny finding: a pattern landing inside a JSON
  * escape sequence used to break JSON.parse).
  */
-export function checkResponse(policy, result) {
-    const window = safeJsonStringify(result).slice(0, policy.scanWindowChars);
+export function checkResponse(policy, result, serialized) {
+    // Fast path: no egress rules configured -> nothing to scan or rewrite, so a
+    // multi-megabyte result is not serialized and walked for no reason.
+    if (policy.responseWarn.length === 0 && policy.responseBlock.length === 0 && !policy.responseRedact.some((p) => p.length > 0)) {
+        return { action: 'pass', result, redactions: 0, warnings: [] };
+    }
+    const window = (serialized ?? safeJsonStringify(result)).slice(0, policy.scanWindowChars);
     const warnings = [];
     for (const pat of policy.responseWarn) {
         if (pat.length > 0 && window.includes(pat))

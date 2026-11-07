@@ -11,6 +11,7 @@ import { ConfigError, configWarnings, loadConfigFile } from './config.js';
 import { startGateway } from './gateway.js';
 import { buildNamespace } from './namespace.js';
 import { DownstreamServer } from './downstream.js';
+import { verifyChain } from './audit.js';
 import { VERSION } from './version.js';
 const HELP = `mcpgateway ${VERSION} — one process fronting all your MCP servers.
 
@@ -20,6 +21,8 @@ Usage:
   mcpgateway validate [-c config.yaml]  Validate config (add --network for reachability checks)
   mcpgateway namespace [-c config.yaml] Connect and print the unified tool table
   mcpgateway init [-o out.yaml]         Write a commented starter config
+  mcpgateway audit-verify <audit.jsonl> [--key-env VAR]
+                                        Verify the audit hash chain (includes rotated .N files)
   mcpgateway --version | --help
 
 Options:
@@ -32,7 +35,7 @@ Options:
 Docs: https://github.com/calasdan-sketch/mcpgateway (when published)
 `;
 function parseArgs(argv) {
-    const args = { command: '', config: './mcpgateway.yaml', network: false, http: false, output: './mcpgateway.yaml', force: false };
+    const args = { command: '', config: './mcpgateway.yaml', network: false, http: false, output: './mcpgateway.yaml', force: false, rest: [] };
     const rest = [];
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
@@ -46,6 +49,8 @@ function parseArgs(argv) {
             args.output = argv[++i];
         else if (a === '-f' || a === '--force')
             args.force = true;
+        else if (a === '--key-env')
+            args.keyEnv = argv[++i];
         else if (a === '--version' || a === '-V')
             return { ...args, command: 'version' };
         else if (a === '--help' || a === '-h')
@@ -57,6 +62,7 @@ function parseArgs(argv) {
     }
     if (rest.length > 0)
         args.command = rest[0];
+    args.rest = rest.slice(1);
     return args;
 }
 // Exported for tests.
@@ -97,6 +103,9 @@ export async function main(argv) {
             return;
         case 'init':
             cmdInit(args);
+            return;
+        case 'audit-verify':
+            cmdAuditVerify(args);
             return;
         default:
             console.error(`unknown command "${args.command}" (see --help)`);
@@ -179,6 +188,39 @@ async function cmdNamespace(args) {
     finally {
         await Promise.all(servers.map((s) => s.close().catch(() => undefined)));
     }
+}
+function cmdAuditVerify(args) {
+    const base = args.rest[0];
+    if (base === undefined) {
+        console.error('error: usage: mcpgateway audit-verify <audit.jsonl> [--key-env VAR]');
+        process.exitCode = 2;
+        return;
+    }
+    let key;
+    if (args.keyEnv !== undefined) {
+        key = process.env[args.keyEnv];
+        if (key === undefined || key === '') {
+            console.error(`error: environment variable ${args.keyEnv} is not set`);
+            process.exitCode = 2;
+            return;
+        }
+    }
+    // oldest first: base.N ... base.1, base
+    const files = [];
+    for (let i = 100; i >= 1; i--)
+        if (existsSync(`${base}.${i}`))
+            files.push(`${base}.${i}`);
+    if (existsSync(base) || files.length === 0)
+        files.push(base); // the live file is absent right after a rotation
+    const r = verifyChain(files, key);
+    if (!r.ok) {
+        console.error(`FAIL: ${r.failure?.file}:${r.failure?.line}: ${r.failure?.reason} (${r.records} record(s) verified before the break)`);
+        process.exitCode = 1;
+        return;
+    }
+    console.log(`ok: ${r.records} record(s) in ${files.length} file(s); chain starts from ${r.anchor ?? 'n/a'}`);
+    if (r.head)
+        console.log(`head: seq=${r.head.seq} hash=${r.head.hash}  (compare with GET /v1/audit/head stored elsewhere to detect truncation)`);
 }
 function cmdInit(args) {
     if (existsSync(args.output) && !args.force) {

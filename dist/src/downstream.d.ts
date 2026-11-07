@@ -10,7 +10,18 @@ type BreakerState = 'closed' | 'open' | 'half-open';
 export interface DownstreamHooks {
     /** Catalogs changed (list_changed notification): rebuild the namespace. */
     onCatalogChanged: (server: DownstreamServer) => void;
+    /** A dead connection was re-established (stdio child restarted, etc.). */
+    onReconnected?: (server: DownstreamServer) => void;
 }
+/** Test hook: a transport, or a factory producing a fresh one per (re)connect. */
+export type TransportOverride = Transport | (() => Transport);
+/**
+ * Did the server ANSWER, with an error that is the caller's fault? Such errors
+ * (bad arguments, unknown method) prove the server is alive and must never
+ * count toward the circuit breaker — otherwise any key holding tools:call
+ * could trip the breaker for the whole fleet with five malformed calls.
+ */
+export declare function isClientFault(e: unknown): boolean;
 export declare class DownstreamServer {
     private cfg;
     private hooks;
@@ -19,6 +30,9 @@ export declare class DownstreamServer {
     readonly name: string;
     private client;
     private transport;
+    private reconnectTimer;
+    private reconnectAttempt;
+    reconnects: number;
     private catalogs;
     private semaphore;
     private breakerState;
@@ -31,11 +45,24 @@ export declare class DownstreamServer {
     lastError: string | null;
     constructor(cfg: ServerConfig, hooks: DownstreamHooks, 
     /** Injected transport for tests (skips spawning/connecting real servers). */
-    transportOverride?: Transport | undefined);
+    transportOverride?: TransportOverride | undefined);
     get inFlight(): number;
     get healthy(): boolean;
     get circuitState(): BreakerState;
     getCatalogs(): ServerCatalogs;
+    private newClient;
+    private nextTransport;
+    /**
+     * The connection died underneath us (stdio child exited, socket closed).
+     * Open the breaker so callers fail fast, then reconnect with capped
+     * exponential backoff. Before this, a crashed stdio server stayed dead until
+     * the gateway was restarted.
+     */
+    private handleClose;
+    private scheduleReconnect;
+    private reconnect;
+    /** Re-fetch every catalog from the live server (admin reload). */
+    refresh(): Promise<void>;
     connect(): Promise<void>;
     private createTransport;
     private registerCatalogWatchers;

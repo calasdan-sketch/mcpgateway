@@ -10,12 +10,12 @@
  *   POST /v1/reload     — refresh all downstream catalogs (admin scope)
  */
 import { createServer as createHttpServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
-import { timingSafeEqual } from 'node:crypto';
 import type { AuditLogger } from './audit.js';
 import type { Metrics } from './metrics.js';
 import type { DownstreamServer } from './downstream.js';
 import type { NamespaceResult } from './namespace.js';
 import type { AuthKey } from './config.js';
+import { matchKey } from './util.js';
 import { VERSION } from './version.js';
 
 export interface AdminDeps {
@@ -25,6 +25,7 @@ export interface AdminDeps {
   getServers: () => DownstreamServer[];
   getNamespace: () => NamespaceResult | null;
   reloadCatalogs: () => Promise<void>;
+  pins?: { violations: () => string[]; accept: (key?: string) => string[] };
 }
 
 function authenticate(req: IncomingMessage, auth: AdminDeps['auth']): { keyId: string; scopes: string[] } | null {
@@ -32,12 +33,8 @@ function authenticate(req: IncomingMessage, auth: AdminDeps['auth']): { keyId: s
   const header = req.headers['authorization'];
   if (typeof header !== 'string' || !header.startsWith('Bearer ')) return null;
   const presented = header.slice('Bearer '.length);
-  for (const k of auth.keys) {
-    if (presented.length === k.key.length && timingSafeEqual(Buffer.from(presented), Buffer.from(k.key))) {
-      return { keyId: k.id, scopes: k.scopes };
-    }
-  }
-  return null;
+  const k = matchKey(auth.keys, presented);
+  return k === null ? null : { keyId: k.id, scopes: k.scopes };
 }
 
 function json(res: ServerResponse, code: number, body: unknown): void {
@@ -92,6 +89,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: AdminDeps
       json(res, 403, { error: `key "${authed.keyId}" lacks scope "admin"` });
       return;
     }
+    // server_up was set once at startup; refresh it from live health so the
+    // gauge actually tracks outages.
+    for (const s of deps.getServers()) deps.metrics.serverUp.set({ server: s.name }, s.healthy ? 1 : 0);
     res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4' });
     res.end(deps.metrics.render());
     return;
@@ -136,6 +136,33 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: AdminDeps
     }
     await deps.reloadCatalogs();
     json(res, 200, { ok: true });
+    return;
+  }
+
+  if (req.method === 'GET' && path === '/v1/audit/head') {
+    if (!isAdmin) {
+      json(res, 403, { error: `key "${authed.keyId}" lacks scope "admin"` });
+      return;
+    }
+    // Store this value somewhere the gateway host cannot rewrite; it is the
+    // only defense against truncation of the newest records.
+    json(res, 200, deps.audit.head());
+    return;
+  }
+
+  if (req.method === 'GET' && path === '/v1/pins') {
+    json(res, 200, { violations: deps.pins?.violations() ?? [] });
+    return;
+  }
+
+  if (req.method === 'POST' && path === '/v1/pins/accept') {
+    if (!isAdmin) {
+      json(res, 403, { error: `key "${authed.keyId}" lacks scope "admin"` });
+      return;
+    }
+    const tool = url.searchParams.get('tool') ?? undefined;
+    const accepted = deps.pins?.accept(tool) ?? [];
+    json(res, 200, { accepted });
     return;
   }
 

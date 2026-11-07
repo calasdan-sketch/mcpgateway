@@ -19,6 +19,12 @@ export interface AuditRecord {
     argsHash?: string;
     policyReason?: string;
     redactions?: number;
+    /** hash chain (audit.chain): monotonically increasing sequence number */
+    seq?: number;
+    /** hash of the previous record */
+    prev?: string;
+    /** hash over this record (excluding this field) chained to prev */
+    hash?: string;
 }
 export declare class AuditLogger {
     private cfg;
@@ -26,11 +32,22 @@ export declare class AuditLogger {
     private bytesWritten;
     private maxBytes;
     errors: number;
+    private seq;
+    private lastHash;
+    private chainLoaded;
     constructor(cfg: AuditConfig, onError?: (() => void) | undefined);
     /** Count a write failure and notify the metrics registry (never throws). */
     private fail;
     /** Append one record. Never throws. */
     log(record: AuditRecord): void;
+    /** Current chain head (for external anchoring). */
+    head(): {
+        seq: number;
+        hash: string;
+    };
+    private chain;
+    /** Resume the chain from the tail of the current file, else the newest rotated file. */
+    private loadChainHead;
     close(): void;
     private ensureOpen;
     private prepare;
@@ -48,4 +65,26 @@ export declare function redactDeep(value: unknown, redactKeys: string[]): unknow
 export declare function collectSecretValues(args: unknown, redactKeys: string[]): string[];
 /** Replace every occurrence of each secret value with [REDACTED]. */
 export declare function redactSecretValues(text: string, secrets: string[]): string;
+export interface VerifyResult {
+    ok: boolean;
+    records: number;
+    /** hash the first verified record chained from (anchor for external comparison) */
+    anchor?: string;
+    head?: {
+        seq: number;
+        hash: string;
+    };
+    failure?: {
+        file: string;
+        line: number;
+        reason: string;
+    };
+}
+/**
+ * Verify a hash chain across files given OLDEST FIRST. Detects edited,
+ * reordered, inserted or deleted-in-the-middle records. It cannot detect
+ * truncation of the newest records on its own: compare `head` with a value
+ * you stored elsewhere (GET /v1/audit/head).
+ */
+export declare function verifyChain(files: string[], key?: string): VerifyResult;
 //# sourceMappingURL=audit.d.ts.map

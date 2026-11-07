@@ -24,7 +24,7 @@ import type { ToolEntry } from './namespace.js';
 import type { AuditLogger } from './audit.js';
 import type { Metrics } from './metrics.js';
 import type { RateLimiter } from './ratelimit.js';
-import type { AuthKey, PolicyConfig, RateLimitRule } from './config.js';
+import type { AuthKey, ExposureConfig, PolicyConfig, RateLimitRule } from './config.js';
 export interface RouteTarget {
     server: DownstreamServer;
     /** original tool/prompt name, or original resource uri */
@@ -74,11 +74,35 @@ export interface UpstreamDeps {
     /** max concurrent Streamable HTTP sessions — abandoned sessions can't grow forever */
     httpMaxSessions: number;
     auth: UpstreamAuth;
+    /** tools/list shape: every tool, or two meta-tools (search + call) */
+    exposure?: ExposureConfig;
+    /** HTTP bind host + Host/Origin allowlists (DNS-rebinding defense) */
+    http?: {
+        host: string;
+        allowedHosts: string[];
+        allowedOrigins: string[];
+        sessionIdleMs?: number;
+    };
 }
 interface AuthedKey {
     keyId: string;
     scopes: string[];
 }
+export declare const META_SEARCH = "gateway_search_tools";
+export declare const META_CALL = "gateway_call_tool";
+/** Hostname part of a Host header or URL host (port stripped, IPv6 brackets kept). */
+export declare function hostnameOf(hostHeader: string): string;
+/**
+ * DNS-rebinding / cross-origin check required by the MCP Streamable HTTP spec.
+ * Returns an error string or null. Without configuration it protects loopback
+ * binds (the case where a browser on the same machine is the threat); a public
+ * bind needs allowedHosts/allowedOrigins to be set to be checked.
+ */
+export declare function checkHostOrigin(cfg: {
+    host: string;
+    allowedHosts: string[];
+    allowedOrigins: string[];
+}, hostHeader: string | undefined, originHeader: string | undefined): string | null;
 export declare class GatewayUpstream {
     private deps;
     private inflight;
@@ -88,6 +112,13 @@ export declare class GatewayUpstream {
     connectStdio(): Promise<void>;
     listenHttp(host: string, port: number): Promise<HttpServer>;
     private handleHttp;
+    private sweepSessions;
+    private keyOf;
+    /** May this key see/call this public tool? (no key = stdio/anonymous = unrestricted here) */
+    private visibleTo;
+    /** Per-key budget across all tools/resources/prompts. true = allowed. */
+    private keyBudgetOk;
+    private handleSearch;
     /** Bearer auth for the HTTP upstream. Returns null when rejected. */
     authenticateHttp(req: IncomingMessage): AuthedKey | null;
     private handleToolCall;

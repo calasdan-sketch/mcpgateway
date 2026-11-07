@@ -1,3 +1,12 @@
+/**
+ * Gateway orchestrator: wires config -> downstream servers -> unified
+ * namespace -> routing table -> upstream + admin.
+ *
+ * The routing table is rebuilt (atomically swapped) whenever a downstream
+ * server's catalog changes. A rebuild that throws (e.g. a newly appeared
+ * collision under `explicit` strategy) keeps the previous table and logs a
+ * warning — a misbehaving server must never take the gateway's namespace down.
+ */
 import { AuditLogger } from './audit.js';
 import { Metrics } from './metrics.js';
 import { RateLimiter } from './ratelimit.js';
@@ -6,6 +15,8 @@ import { GatewayUpstream, publicResourceUri } from './upstream.js';
 import { buildNamespace, resolveNames } from './namespace.js';
 import { configWarnings } from './config.js';
 import { VERSION } from './version.js';
+import { PinRegistry, suspiciousDescription } from './pins.js';
+import { stripHostile } from './util.js';
 export async function startGateway(cfg, opts = {}) {
     const log = opts.log ?? ((m) => console.error(m));
     const metrics = new Metrics();
@@ -14,11 +25,13 @@ export async function startGateway(cfg, opts = {}) {
     const audit = new AuditLogger(cfg.audit, () => metrics.auditErrors.inc({}));
     metrics.buildInfo.set({ version: VERSION }, 1);
     const rateLimiter = new RateLimiter();
+    // Throws on a corrupt pin file in block/warn mode: fail closed at startup.
+    const pins = new PinRegistry(cfg.policy.pinning ?? { mode: 'off' });
     const state = { namespace: null, table: null };
     const rebuildNamespace = (why) => {
         try {
             const catalogs = servers.map((s) => ({ server: s.name, tools: s.getCatalogs().tools }));
-            const ns = buildNamespace(catalogs, cfg.namespace);
+            const ns = hardenNamespace(buildNamespace(catalogs, cfg.namespace), pins, metrics, audit, log);
             state.namespace = ns;
             state.table = buildRoutingTable(servers, ns, cfg);
             for (const w of ns.warnings)
@@ -31,7 +44,13 @@ export async function startGateway(cfg, opts = {}) {
             log(`[mcpgateway] WARNING: namespace rebuild failed (${why}): ${e.message} — keeping previous table`);
         }
     };
-    const servers = cfg.servers.map((sc) => new DownstreamServer(sc, { onCatalogChanged: () => rebuildNamespace(`catalog change`) }, opts.transportOverrides?.get(sc.name)));
+    const servers = cfg.servers.map((sc) => new DownstreamServer(sc, {
+        onCatalogChanged: () => rebuildNamespace(`catalog change`),
+        onReconnected: (srv) => {
+            metrics.serverReconnects.inc({ server: srv.name });
+            log(`[mcpgateway] server "${srv.name}" reconnected`);
+        },
+    }, opts.transportOverrides?.get(sc.name)));
     // Connect sequentially: deterministic startup order, clearer errors.
     for (const s of servers) {
         try {
@@ -79,6 +98,8 @@ export async function startGateway(cfg, opts = {}) {
         maxResultChars: cfg.maxResultChars,
         httpMaxSessions: cfg.upstream.http.maxSessions,
         auth: cfg.auth,
+        exposure: cfg.exposure,
+        http: { host: cfg.upstream.http.host, allowedHosts: cfg.upstream.http.allowedHosts, allowedOrigins: cfg.upstream.http.allowedOrigins },
     };
     const upstream = new GatewayUpstream(deps);
     // Prune idle rate-limit buckets on a slow timer; unref'd so it never
@@ -94,7 +115,19 @@ export async function startGateway(cfg, opts = {}) {
             metrics,
             getServers: () => servers,
             getNamespace: () => state.namespace,
-            reloadCatalogs: async () => rebuildNamespace('admin reload'),
+            pins: {
+                violations: () => pins.violationKeys(),
+                accept: (key) => {
+                    const accepted = pins.accept(key);
+                    if (accepted.length > 0)
+                        rebuildNamespace('pin accepted');
+                    return accepted;
+                },
+            },
+            reloadCatalogs: async () => {
+                await Promise.all(servers.map((s) => s.refresh()));
+                rebuildNamespace('admin reload');
+            },
         }, cfg.admin.host, cfg.admin.port);
         log(`[mcpgateway] admin API on http://${cfg.admin.host}:${cfg.admin.port}`);
     }
@@ -111,7 +144,11 @@ export async function startGateway(cfg, opts = {}) {
         audit,
         metrics,
         getNamespace: () => state.namespace,
-        reloadCatalogs: async () => rebuildNamespace('manual reload'),
+        pins,
+        reloadCatalogs: async () => {
+            await Promise.all(servers.map((s) => s.refresh()));
+            rebuildNamespace('manual reload');
+        },
         close: async () => {
             if (closed)
                 return;
@@ -130,6 +167,59 @@ export async function startGateway(cfg, opts = {}) {
     if (adminServer)
         gateway.adminServer = adminServer;
     return gateway;
+}
+/**
+ * Between the raw catalogs and the routing table: pin check (rug-pull
+ * defense) and neutralizing of terminal-control / bidi / zero-width characters
+ * in anything the model or an operator's terminal will read.
+ */
+function hardenNamespace(ns, pins, metrics, audit, log) {
+    const report = pins.evaluate(ns.tools.map((t) => ({ server: t.server, originalName: t.originalName, description: t.description, inputSchema: t.inputSchema })));
+    for (const k of report.changed) {
+        metrics.pinViolations.inc({});
+        const quarantined = pins.mode === 'block';
+        log(`[mcpgateway] WARNING: tool "${k}" changed since it was pinned${quarantined ? ' — QUARANTINED until accepted (POST /v1/pins/accept)' : ''}`);
+        audit.log({
+            ts: new Date().toISOString(),
+            reqId: 'pin',
+            tool: k,
+            server: k.split(':')[0] ?? '',
+            originalTool: k,
+            durationMs: 0,
+            status: quarantined ? 'blocked' : 'ok',
+            policyReason: 'pin_changed',
+            errorMessage: 'tool description or schema changed since pinned',
+        });
+    }
+    const warnings = [...ns.warnings];
+    const tools = [];
+    for (const t of ns.tools) {
+        if (pins.quarantined(t.server, t.originalName))
+            continue;
+        const hits = suspiciousDescription(t.description);
+        if (hits.length > 0)
+            warnings.push(`tool "${t.publicName}" description looks instruction-like (${hits.join('; ')}) — review it`);
+        const d = t.description === undefined ? undefined : stripHostile(t.description);
+        if (d?.changed)
+            warnings.push(`tool "${t.publicName}" description contained control/bidi/zero-width characters (replaced)`);
+        tools.push({ ...t, description: d?.text ?? t.description, inputSchema: sanitizeSchema(t.inputSchema) });
+    }
+    return { ...ns, tools, byPublicName: new Map(tools.map((t) => [t.publicName, t])), warnings };
+}
+function sanitizeSchema(v, depth = 0) {
+    if (depth > 40)
+        return v;
+    if (typeof v === 'string')
+        return stripHostile(v).text;
+    if (Array.isArray(v))
+        return v.map((x) => sanitizeSchema(x, depth + 1));
+    if (v !== null && typeof v === 'object') {
+        const out = {};
+        for (const [k, val] of Object.entries(v))
+            out[k] = sanitizeSchema(val, depth + 1);
+        return out;
+    }
+    return v;
 }
 async function closeServers(servers) {
     await Promise.all(servers.map((s) => s.close().catch(() => undefined)));

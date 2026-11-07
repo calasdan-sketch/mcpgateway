@@ -16,4 +16,16 @@ export declare function nowIso(): string;
  * Everything else is matched literally, so patterns can never ReDoS.
  */
 export declare function globMatch(pattern: string, value: string): boolean;
+/**
+ * Constant-time bearer-key lookup. Compares SHA-256 digests (always 32 bytes)
+ * and scans every key, so neither the presented key's length nor the position
+ * of the matching key leaks through timing.
+ */
+export declare function matchKey<K extends {
+    key: string;
+}>(keys: K[], presented: string): K | null;
+export declare function stripHostile(s: string): {
+    text: string;
+    changed: boolean;
+};
 //# sourceMappingURL=util.d.ts.map

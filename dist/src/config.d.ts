@@ -44,11 +44,30 @@ export interface PolicyConfig {
     responseBlock: string[];
     responseWarn: string[];
     scanWindowChars: number;
+    /** Rug-pull defense: pin each tool's description+schema hash (trust on first use). */
+    pinning?: PinningConfig;
+}
+export interface PinningConfig {
+    /** off: nothing; warn: log+metric on change; block: quarantine changed tools until accepted */
+    mode: 'off' | 'warn' | 'block';
+    /** JSON file the pins persist in (omit = in-memory, lost on restart) */
+    file?: string;
 }
 export interface AuthKey {
     id: string;
     key: string;
     scopes: string[];
+    /** per-key tool visibility (globs over public names); deny wins. Omitted = everything policy allows. */
+    allowTools?: string[];
+    denyTools?: string[];
+    /** per-key budget across ALL tools, so one noisy agent cannot starve the others */
+    rateLimit?: RateLimitRule;
+}
+export interface ExposureConfig {
+    /** full: every tool in tools/list (default). search: two meta-tools + alwaysExpose. */
+    mode: 'full' | 'search';
+    /** globs of public tool names that stay listed directly in search mode */
+    alwaysExpose: string[];
 }
 export interface AuditConfig {
     path: string;
@@ -57,6 +76,10 @@ export interface AuditConfig {
     maxArgsChars: number;
     maxSizeMB: number;
     keepFiles: number;
+    /** tamper-evident hash chain over records (see `mcpgateway audit-verify`) */
+    chain?: boolean;
+    /** optional HMAC secret for the chain; without it an attacker who can rewrite the file can recompute hashes */
+    chainKey?: string;
 }
 export interface AdminConfig {
     enabled: boolean;
@@ -73,6 +96,8 @@ export interface UpstreamConfig {
         host: string;
         port: number;
         maxSessions: number;
+        allowedHosts: string[];
+        allowedOrigins: string[];
     };
 }
 export interface GatewayConfig {
@@ -89,6 +114,7 @@ export interface GatewayConfig {
     audit: AuditConfig;
     admin: AdminConfig;
     upstream: UpstreamConfig;
+    exposure: ExposureConfig;
     globalMaxInflight: number;
     maxResultChars: number;
 }

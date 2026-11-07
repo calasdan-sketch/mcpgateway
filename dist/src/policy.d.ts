@@ -27,5 +27,5 @@ export declare function checkToolCall(policy: PolicyConfig, publicToolName: stri
  * produce invalid JSON (scrutiny finding: a pattern landing inside a JSON
  * escape sequence used to break JSON.parse).
  */
-export declare function checkResponse(policy: PolicyConfig, result: unknown): ResponseVerdict;
+export declare function checkResponse(policy: PolicyConfig, result: unknown, serialized?: string): ResponseVerdict;
 //# sourceMappingURL=policy.d.ts.map

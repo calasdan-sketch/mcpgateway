@@ -11,8 +11,8 @@
  *  - Size-based rotation with a bounded number of kept files: the audit log
  *    can never fill the disk unboundedly.
  */
-import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createHash, createHmac } from 'node:crypto';
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { nowIso, safeJsonStringify, truncate } from './util.js';
 const REDACTED = '[REDACTED]';
 export class AuditLogger {
@@ -21,6 +21,9 @@ export class AuditLogger {
     bytesWritten = 0;
     maxBytes;
     errors = 0;
+    seq = 0;
+    lastHash = 'genesis';
+    chainLoaded = false;
     constructor(cfg, onError) {
         this.cfg = cfg;
         this.onError = onError;
@@ -40,14 +43,58 @@ export class AuditLogger {
     log(record) {
         try {
             this.ensureOpen();
-            const line = safeJsonStringify(this.prepare(record)) + '\n';
+            let prepared = this.prepare(record);
+            if (this.cfg.chain === true)
+                prepared = this.chain(prepared);
+            const line = safeJsonStringify(prepared) + '\n';
             appendFileSync(this.cfg.path, line, { encoding: 'utf8' });
+            // Commit chain state only after the write succeeded, so a transient disk
+            // error cannot leave a phantom link that later reads as tampering.
+            if (this.cfg.chain === true && prepared.seq !== undefined && prepared.hash !== undefined) {
+                this.seq = prepared.seq;
+                this.lastHash = prepared.hash;
+            }
             this.bytesWritten += Buffer.byteLength(line);
             if (this.bytesWritten >= this.maxBytes)
                 this.rotate();
         }
         catch {
             this.fail();
+        }
+    }
+    /** Current chain head (for external anchoring). */
+    head() {
+        if (this.cfg.chain === true && !this.chainLoaded)
+            this.loadChainHead();
+        return { seq: this.seq, hash: this.lastHash };
+    }
+    chain(rec) {
+        if (!this.chainLoaded)
+            this.loadChainHead();
+        const body = { ...rec, seq: this.seq + 1, prev: this.lastHash };
+        const hash = chainHash(this.cfg.chainKey, safeJsonStringify(body));
+        return { ...body, hash };
+    }
+    /** Resume the chain from the tail of the current file, else the newest rotated file. */
+    loadChainHead() {
+        this.chainLoaded = true;
+        for (const f of [this.cfg.path, `${this.cfg.path}.1`]) {
+            const tail = lastLine(f);
+            if (tail === null)
+                continue;
+            try {
+                const r = JSON.parse(tail);
+                if (typeof r.seq === 'number' && typeof r.hash === 'string') {
+                    this.seq = r.seq;
+                    this.lastHash = r.hash;
+                    return;
+                }
+            }
+            catch {
+                /* unparsable tail: start a visibly-broken new segment */
+            }
+            this.lastHash = 'unverified-tail';
+            return;
         }
     }
     close() {
@@ -181,5 +228,92 @@ export function redactSecretValues(text, secrets) {
         }
     }
     return out;
+}
+function chainHash(key, text) {
+    const h = key !== undefined ? createHmac('sha256', key) : createHash('sha256');
+    return (key !== undefined ? 'hmac-sha256:' : 'sha256:') + h.update(text).digest('hex');
+}
+/** Last non-empty line of a file, reading only the tail. null if missing/empty. */
+function lastLine(path) {
+    let fd;
+    try {
+        fd = openSync(path, 'r');
+    }
+    catch {
+        return null;
+    }
+    try {
+        const size = statSync(path).size;
+        if (size === 0)
+            return null;
+        const len = Math.min(size, 65536);
+        const buf = Buffer.alloc(len);
+        readSync(fd, buf, 0, len, size - len);
+        const lines = buf.toString('utf8').split('\n').filter((l) => l.length > 0);
+        return lines.length > 0 ? lines[lines.length - 1] : null;
+    }
+    finally {
+        closeSync(fd);
+    }
+}
+/**
+ * Verify a hash chain across files given OLDEST FIRST. Detects edited,
+ * reordered, inserted or deleted-in-the-middle records. It cannot detect
+ * truncation of the newest records on its own: compare `head` with a value
+ * you stored elsewhere (GET /v1/audit/head).
+ */
+export function verifyChain(files, key) {
+    let prev;
+    let seq;
+    let records = 0;
+    let anchor;
+    for (const file of files) {
+        let text;
+        try {
+            text = readFileSync(file, 'utf8');
+        }
+        catch (e) {
+            return { ok: false, records, failure: { file, line: 0, reason: `cannot read: ${e.message}` } };
+        }
+        const lines = text.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+            const raw = lines[i];
+            if (raw.length === 0)
+                continue;
+            const fail = (reason) => ({ ok: false, records, anchor, failure: { file, line: i + 1, reason } });
+            let rec;
+            try {
+                rec = JSON.parse(raw);
+            }
+            catch {
+                return fail('line is not valid JSON');
+            }
+            if (typeof rec.seq !== 'number' || typeof rec.prev !== 'string' || typeof rec.hash !== 'string')
+                return fail('record has no chain fields');
+            if (prev === undefined) {
+                anchor = rec.prev;
+            }
+            else {
+                if (rec.prev !== prev)
+                    return fail('prev hash does not match the preceding record (record removed, inserted or reordered)');
+                if (seq !== undefined && rec.seq !== seq + 1)
+                    return fail(`sequence jumps from ${seq} to ${rec.seq}`);
+            }
+            const { hash, ...body } = rec;
+            if (key === undefined && hash.startsWith('hmac-sha256:'))
+                return fail('log is HMAC-chained; supply the key');
+            if (chainHash(key, safeJsonStringify(body)) !== hash)
+                return fail('hash mismatch (record was modified)');
+            prev = hash;
+            seq = rec.seq;
+            records += 1;
+        }
+    }
+    const result = { ok: true, records };
+    if (anchor !== undefined)
+        result.anchor = anchor;
+    if (prev !== undefined && seq !== undefined)
+        result.head = { seq, hash: prev };
+    return result;
 }
 //# sourceMappingURL=audit.js.map

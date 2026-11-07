@@ -48,6 +48,11 @@ policy:
   responseRedact: []      # substrings replaced with [REDACTED] in results
   responseBlock: []       # substrings that block the result entirely
   responseWarn: []        # substrings that only audit-log a warning
+  # Rug-pull defense: pin each tool's description+schema (trust on first use).
+  # "block" quarantines a changed tool until you accept it: POST /v1/pins/accept
+  pinning:
+    mode: off             # off | warn | block   (block requires a file)
+    # file: ./mcpgateway-pins.json
 
 auth:
   disabled: false
@@ -55,6 +60,10 @@ auth:
     - id: agent-1
       key: "${GATEWAY_KEY:-changeme-to-a-long-random-secret}"
       scopes: ["tools:call", "tools:list"]   # + resources:*, prompts:*, admin
+      # Optional per-key limits (globs over public tool names; deny wins):
+      # allowTools: ["github__search_*"]
+      # denyTools: ["*__delete_*"]
+      # rateLimit: { rps: 5, burst: 10 }       # budget across ALL of this key's calls
 
 audit:
   path: ./mcpgateway-audit.jsonl
@@ -63,6 +72,8 @@ audit:
   maxArgsChars: 8192
   maxSizeMB: 100
   keepFiles: 5
+  chain: false            # true -> tamper-evident hash chain; check with: mcpgateway audit-verify <path>
+  # chainKey: "${AUDIT_CHAIN_KEY}"   # optional HMAC secret (16+ chars); keep it off this host's disk
 
 admin:
   enabled: true
@@ -75,7 +86,18 @@ upstream:
     enabled: false
     host: 127.0.0.1
     port: 3000
-    maxSessions: 128    # abandoned SSE sessions can't grow this table forever
+    maxSessions: 128    # idle sessions expire after 30 min; one key may hold at most half
+    # DNS-rebinding defense. Loopback binds are protected by default; for a public
+    # bind list your hostnames/origins here or Host/Origin are NOT checked.
+    # allowedHosts: ["gateway.example.com"]
+    # allowedOrigins: ["https://app.example.com"]
+
+# Context-window saver: with many tools, list two meta-tools instead of all of
+# them. The agent calls gateway_search_tools, then gateway_call_tool (policy,
+# rate limits, per-key ACLs and audit apply exactly as for direct calls).
+exposure:
+  mode: full              # full | search
+  alwaysExpose: []        # globs of tools that stay listed in search mode
 
 globalMaxInflight: 256    # hard cap on concurrent tool calls gateway-wide
 maxResultChars: 10000000  # drop tool results larger than this (OOM guard)
