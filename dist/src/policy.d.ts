@@ -20,7 +20,7 @@ export declare function checkToolCall(policy: PolicyConfig, publicToolName: stri
 export interface ArgMatchOptions {
     /** compare case-insensitively (deny "/etc/passwd" also stops "/ETC/Passwd"); also strips invisible characters and folds Unicode compatibility forms */
     ignoreCase: boolean;
-    /** treat \\ as /, percent-decode (up to 3 layers), collapse "//", "/./" and "/../" before comparing; same invisible/Unicode folding as ignoreCase */
+    /** treat backslash as /, percent-decode (up to 3 layers), collapse "//", "/./" and "/../" before comparing; same invisible/Unicode folding as ignoreCase */
     normalizePaths: boolean;
 }
 /**

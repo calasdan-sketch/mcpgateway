@@ -45,6 +45,13 @@ policy:
   denyTools: []
   hideTools: []           # hidden from tools/list AND denied on call
   argRules: {}            # {"tool*": {deny: ["substring"], allow: ["substring"]}} — substring, not regex
+  # How argRules compare. Each rule is tested against the JSON text AND every raw string
+  # value/key (so a Windows path with backslashes matches). Default is exact; turn these
+  # on for deny rules that guard paths or URLs:
+  #   ignoreCase     "/ETC/Passwd" matches a "/etc/passwd" rule; invisible characters are
+  #                  removed and full-width forms folded first
+  #   normalizePaths backslash = slash, "//" "/./" "/../" collapsed, %-encoding decoded
+  argMatch: { ignoreCase: false, normalizePaths: false }
   responseRedact: []      # substrings replaced with [REDACTED] in results
   responseBlock: []       # substrings that block the result entirely
   responseWarn: []        # substrings that only audit-log a warning
@@ -58,8 +65,14 @@ auth:
   disabled: false
   keys:
     - id: agent-1
-      key: "${GATEWAY_KEY:-changeme-to-a-long-random-secret}"
+      key: "${GATEWAY_KEY}"     # unset = startup error (there is deliberately no default secret)
+      # Or keep the secret out of this file: `mcpgateway hash-key --generate` prints a
+      # key for the client and the keyHash to paste here instead of `key:`
+      # keyHash: "sha256:..."
       scopes: ["tools:call", "tools:list"]   # + resources:*, prompts:*, admin
+      # expiresAt: "2027-01-31T00:00:00Z"    # key stops working at this instant
+      # readOnly: true                          # only tools whose server declared readOnlyHint: true
+      # allowServers: ["github", "docs"]       # tools, resources and prompts of these servers only
       # Optional per-key limits (globs over public tool names; deny wins):
       # allowTools: ["github__search_*"]
       # denyTools: ["*__delete_*"]
@@ -69,6 +82,7 @@ audit:
   path: ./mcpgateway-audit.jsonl
   logArgs: true           # false -> only a sha256 of args is logged
   redactKeys: [token, secret, password]      # key-name substrings, case-insensitive
+  redactValues: true      # also redact credential shapes (Bearer/JWT/sk-/ghp_/AKIA/xox/PEM/URL passwords) in any value
   maxArgsChars: 8192
   maxSizeMB: 100
   keepFiles: 5
@@ -79,6 +93,7 @@ admin:
   enabled: true
   host: 127.0.0.1        # never 0.0.0.0 without allowPublicAdmin: true
   port: 3001
+  # allowedHosts: ["gateway-admin.internal"]   # Host header names accepted (loopback binds accept loopback names only)
 
 upstream:
   stdio: { enabled: true }                          # drop-in: swap the agent's server command

@@ -469,6 +469,8 @@ export function validateConfig(raw, source, opts = {}) {
                 if (id && (key || keyHash)) {
                     if (key && key.length < 16)
                         p.push(`${kc}: key is shorter than 16 chars — use a long random secret`);
+                    if (/^change-?me/i.test(key))
+                        p.push(`${kc}: key looks like a placeholder ("changeme...") — anyone who has read the docs knows it; use a real secret`);
                     const entry = { id, key, scopes };
                     if (keyHash !== undefined)
                         entry.keyHash = keyHash;

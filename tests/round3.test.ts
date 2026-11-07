@@ -23,6 +23,7 @@ import { checkToolCall } from '../src/policy.js';
 import { collectPages } from '../src/downstream.js';
 import { legacyDefinitionHash, definitionHash } from '../src/pins.js';
 import { hashKey, matchKey } from '../src/util.js';
+import { META_CALL, META_SEARCH } from '../src/upstream.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(here, 'fixtures', 'stdio-server.js');
@@ -686,4 +687,29 @@ test('log lines cannot be forged with newlines in server-controlled text', async
     await gw.close();
     await fake.server.close().catch(() => undefined);
   }
+});
+
+test('search exposure honours readOnly and allowServers (meta-tool cannot widen a key)', async () => {
+  const a = makeFake([{ name: 'get_a', annotations: { readOnlyHint: true } }, { name: 'set_a' }]);
+  const b = makeFake([{ name: 'get_b', annotations: { readOnlyHint: true } }]);
+  const h = await bootHttp([{ id: 'ro', key: K1, readOnly: true, allowServers: ['a'] }], { a, b }, { exposure: { mode: 'search' } });
+  try {
+    const s = await session(h.port, K1);
+    const found = await post(h.port, s, rpc(2, 'tools/call', { name: META_SEARCH, arguments: { query: 'a b get set' } }));
+    assert.ok(found.body.includes('get_a') && !found.body.includes('set_a') && !found.body.includes('get_b'), found.body);
+    assert.ok(found.body.includes('readOnlyHint'), 'annotations appear in search results');
+    for (const name of ['set_a', 'get_b']) {
+      assert.ok((await post(h.port, s, rpc(3, 'tools/call', { name: META_CALL, arguments: { name, arguments: {} } }))).body.includes('unknown tool'), name);
+    }
+    assert.ok((await post(h.port, s, rpc(4, 'tools/call', { name: META_CALL, arguments: { name: 'get_a', arguments: {} } }))).body.includes('ran:get_a'));
+  } finally {
+    await h.close();
+  }
+});
+
+test('placeholder keys ("changeme...") are refused', () => {
+  const mk = (key: string) => () => validateConfig({ servers: [{ name: 's', transport: 'stdio', command: 'true' }], auth: { keys: [{ id: 'a', key }] } } as Raw, 'test');
+  assert.throws(mk('changeme-to-a-long-random-secret'), /placeholder/);
+  assert.throws(mk('Change-Me-please-123456'), /placeholder/);
+  assert.doesNotThrow(mk('x'.repeat(24)));
 });

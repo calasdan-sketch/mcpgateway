@@ -10,7 +10,8 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { validateConfig } from '../dist/src/config.js';
 import { startGateway } from '../dist/src/gateway.js';
-import { AuditLogger } from '../dist/src/audit.js';
+import { AuditLogger, redactText } from '../dist/src/audit.js';
+import { checkToolCall } from '../dist/src/policy.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const FIXTURE = join(root, 'dist', 'tests', 'fixtures', 'stdio-server.js');
@@ -91,5 +92,26 @@ for (const chain of [false, true]) {
   const ms = Number(process.hrtime.bigint() - s) / 1e6;
   console.log(`chain=${chain}: ${(20000 / (ms / 1000)).toFixed(0)} records/s`);
 }
+
+console.log('\n## 4. argument-rule evaluation (checkToolCall, microseconds per call, 50000 calls)');
+const mkPolicy = (argMatch) => validateConfig({ servers: [{ name: 's', transport: 'stdio', command: 'true' }], auth: { disabled: true }, policy: { argMatch, argRules: { t: { deny: ['/etc/passwd', 'rm -rf', '169.254.169.254'] } } } }, 'bench').policy;
+const argsSmall = { path: '/home/user/project/readme.md', mode: 'r' };
+const argsLarge = { files: Array.from({ length: 200 }, (_, i) => ({ path: `/srv/data/${i}/file-${i}.txt`, note: 'x'.repeat(400) })) };
+console.log('| mode | ~100 B args | ~100 KB args |\n|---|---|---|');
+for (const [label, m] of [['exact (default)', {}], ['ignoreCase', { ignoreCase: true }], ['ignoreCase + normalizePaths', { ignoreCase: true, normalizePaths: true }]]) {
+  const pol = mkPolicy(m);
+  const run = (a, n) => { const st = process.hrtime.bigint(); for (let i = 0; i < n; i++) checkToolCall(pol, 't', a); return Number(process.hrtime.bigint() - st) / 1e3 / n; };
+  console.log(`| ${label} | ${run(argsSmall, 50000).toFixed(1)} us | ${run(argsLarge, 500).toFixed(0)} us |`);
+}
+
+console.log('\n## 5. audit writer with credential-shape redaction (20000 records, 600-char string args)');
+const note = 'customer asked about invoice 4471 and the refund policy for orders shipped last month; '.repeat(7);
+for (const redactValues of [false, true]) {
+  const log = new AuditLogger({ path: join(dir, `v-${redactValues}.jsonl`), logArgs: true, redactKeys: ['token'], maxArgsChars: 8192, maxSizeMB: 500, keepFiles: 2, chain: false, redactValues });
+  const st = process.hrtime.bigint();
+  for (let i = 0; i < 20000; i++) log.log({ ts: new Date().toISOString(), reqId: String(i), tool: 't', server: 's', originalTool: 't', durationMs: 1, status: 'ok', args: { note } });
+  console.log(`redactValues=${redactValues}: ${(20000 / (Number(process.hrtime.bigint() - st) / 1e9)).toFixed(0)} records/s`);
+}
+
 rmSync(dir, { recursive: true, force: true });
 process.exit(0);
