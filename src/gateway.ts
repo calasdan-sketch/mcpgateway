@@ -39,6 +39,8 @@ export interface StartOptions {
   transportOverrides?: Map<string, import('./downstream.js').TransportOverride>;
   /** Skip starting the admin HTTP API (tests). */
   noAdmin?: boolean;
+  /** Test hook: receives sanitized stderr lines from stdio children instead of process.stderr. */
+  onChildStderr?: (server: string, line: string) => void;
   /** Where operational logs go (stderr in stdio mode). Defaults to console. */
   log?: (msg: string) => void;
   /** Started HTTP upstream server, if enabled. */
@@ -48,7 +50,9 @@ export interface StartOptions {
 }
 
 export async function startGateway(cfg: GatewayConfig, opts: StartOptions = {}): Promise<Gateway> {
-  const log = opts.log ?? ((m: string) => console.error(m));
+  // Everything logged may contain server-controlled text (tool names, errors): neutralize terminal control and bidi characters.
+  const sink = opts.log ?? ((m: string) => console.error(m));
+  const log = (m: string) => sink(stripHostile(m).text.replace(/[\r\n]+/g, ' ⏎ '));
   const metrics = new Metrics();
   // Blueprint §5: audit write failures are counted in Prometheus, never
   // fatal to the request path.
@@ -84,6 +88,7 @@ export async function startGateway(cfg: GatewayConfig, opts: StartOptions = {}):
             metrics.serverReconnects.inc({ server: srv.name });
             log(`[mcpgateway] server "${srv.name}" reconnected`);
           },
+          ...(opts.onChildStderr ? { onChildStderr: opts.onChildStderr } : {}),
         },
         opts.transportOverrides?.get(sc.name),
       ),
@@ -153,6 +158,7 @@ export async function startGateway(cfg: GatewayConfig, opts: StartOptions = {}):
         auth: cfg.auth,
         audit,
         metrics,
+        bind: { host: cfg.admin.host, allowedHosts: cfg.admin.allowedHosts },
         getServers: () => servers,
         getNamespace: () => state.namespace,
         pins: {
@@ -220,7 +226,9 @@ function hardenNamespace(
   audit: AuditLogger,
   log: (m: string) => void,
 ): NamespaceResult {
-  const report = pins.evaluate(ns.tools.map((t) => ({ server: t.server, originalName: t.originalName, description: t.description, inputSchema: t.inputSchema })));
+  const report = pins.evaluate(
+    ns.tools.map((t) => ({ server: t.server, originalName: t.originalName, description: t.description, inputSchema: t.inputSchema, annotations: t.annotations, outputSchema: t.outputSchema, title: t.title })),
+  );
   for (const k of report.changed) {
     metrics.pinViolations.inc({});
     const quarantined = pins.mode === 'block';
@@ -245,7 +253,11 @@ function hardenNamespace(
     if (hits.length > 0) warnings.push(`tool "${t.publicName}" description looks instruction-like (${hits.join('; ')}) — review it`);
     const d = t.description === undefined ? undefined : stripHostile(t.description);
     if (d?.changed) warnings.push(`tool "${t.publicName}" description contained control/bidi/zero-width characters (replaced)`);
-    tools.push({ ...t, description: d?.text ?? t.description, inputSchema: sanitizeSchema(t.inputSchema) });
+    const clean: typeof t = { ...t, description: d?.text ?? t.description, inputSchema: sanitizeSchema(t.inputSchema) };
+    if (t.annotations !== undefined) clean.annotations = sanitizeSchema(t.annotations) as Record<string, unknown>;
+    if (t.outputSchema !== undefined) clean.outputSchema = sanitizeSchema(t.outputSchema);
+    if (t.title !== undefined) clean.title = stripHostile(t.title).text;
+    tools.push(clean);
   }
   return { ...ns, tools, byPublicName: new Map(tools.map((t) => [t.publicName, t])), warnings };
 }

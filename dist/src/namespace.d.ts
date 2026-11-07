@@ -20,6 +20,10 @@ export interface CatalogTool {
     name: string;
     description?: string;
     inputSchema?: unknown;
+    /** MCP tool annotations (readOnlyHint, destructiveHint, ...). Server-claimed, so pinned. */
+    annotations?: Record<string, unknown>;
+    outputSchema?: unknown;
+    title?: string;
 }
 export interface ServerCatalog {
     server: string;

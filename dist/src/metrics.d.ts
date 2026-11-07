@@ -46,6 +46,9 @@ export declare class Metrics {
     readonly upstreamErrors: Counter;
     readonly serverReconnects: Counter;
     readonly pinViolations: Counter;
+    readonly authFailures: Counter;
+    readonly keyCalls: Counter;
+    readonly cancelled: Counter;
     readonly serverUp: Gauge;
     readonly serverInflight: Gauge;
     readonly gatewayInflight: Gauge;

@@ -111,6 +111,9 @@ export class Metrics {
     upstreamErrors = new Counter('mcpgateway_upstream_errors_total', 'Upstream transport errors.');
     serverReconnects = new Counter('mcpgateway_server_reconnects_total', 'Downstream connections re-established after a crash or disconnect.');
     pinViolations = new Counter('mcpgateway_tool_pin_violations_total', 'Tools whose description or schema changed after being pinned.');
+    authFailures = new Counter('mcpgateway_auth_failures_total', 'Rejected HTTP requests at the edge, by reason (bad_key, missing_scope, wrong_session_key, bad_host).');
+    keyCalls = new Counter('mcpgateway_key_calls_total', 'Tool calls by configured key id and outcome (key ids come from config, so cardinality is bounded).');
+    cancelled = new Counter('mcpgateway_tool_calls_cancelled_total', 'Tool calls the client cancelled before they finished.');
     serverUp = new Gauge('mcpgateway_server_up', '1 when the downstream server is connected and healthy.');
     serverInflight = new Gauge('mcpgateway_server_inflight', 'Tool calls currently executing per downstream server.');
     gatewayInflight = new Gauge('mcpgateway_gateway_inflight', 'Tool calls currently executing across the gateway.');
@@ -126,6 +129,9 @@ export class Metrics {
             this.upstreamErrors.render(),
             this.serverReconnects.render(),
             this.pinViolations.render(),
+            this.authFailures.render(),
+            this.keyCalls.render(),
+            this.cancelled.render(),
             this.serverUp.render(),
             this.serverInflight.render(),
             this.gatewayInflight.render(),

@@ -29,6 +29,11 @@ export interface AdminDeps {
         violations: () => string[];
         accept: (key?: string) => string[];
     };
+    /** bind host and Host-header allowlist (DNS-rebinding defense) */
+    bind?: {
+        host: string;
+        allowedHosts: string[];
+    };
 }
 export declare function startAdmin(deps: AdminDeps, host: string, port: number): Promise<HttpServer>;
 //# sourceMappingURL=admin.d.ts.map

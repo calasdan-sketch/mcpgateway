@@ -12,7 +12,14 @@ export interface DownstreamHooks {
     onCatalogChanged: (server: DownstreamServer) => void;
     /** A dead connection was re-established (stdio child restarted, etc.). */
     onReconnected?: (server: DownstreamServer) => void;
+    /** A sanitized line a stdio child wrote to stderr. Default: process.stderr. */
+    onChildStderr?: (server: string, line: string) => void;
 }
+/** Follow nextCursor to the end (bounded; a repeated cursor ends the walk). */
+export declare function collectPages<T>(fetchPage: (cursor?: string) => Promise<{
+    items: T[];
+    nextCursor?: string | undefined;
+}>): Promise<T[]>;
 /** Test hook: a transport, or a factory producing a fresh one per (re)connect. */
 export type TransportOverride = Transport | (() => Transport);
 /**
@@ -22,6 +29,8 @@ export type TransportOverride = Transport | (() => Transport);
  * could trip the breaker for the whole fleet with five malformed calls.
  */
 export declare function isClientFault(e: unknown): boolean;
+/** The caller gave up (client sent notifications/cancelled). The server did nothing wrong. */
+export declare function isCancellation(e: unknown): boolean;
 export declare class DownstreamServer {
     private cfg;
     private hooks;
@@ -65,6 +74,8 @@ export declare class DownstreamServer {
     refresh(): Promise<void>;
     connect(): Promise<void>;
     private createTransport;
+    private pumpStderr;
+    private writeChildLine;
     private registerCatalogWatchers;
     private refreshCatalogs;
     private startHealthChecks;
@@ -73,7 +84,7 @@ export declare class DownstreamServer {
      * Call a tool on this server. Enforces the circuit breaker, concurrency
      * bound, and per-call timeout. Throws on failure (caller maps to JSON-RPC).
      */
-    callTool(originalName: string, args: unknown): Promise<CallToolResult>;
+    callTool(originalName: string, args: unknown, signal?: AbortSignal): Promise<CallToolResult>;
     private onSuccess;
     /** Read a resource by its ORIGINAL uri. Same breaker/timeout discipline as tools. */
     readResource(originalUri: string): Promise<ReadResourceResult>;

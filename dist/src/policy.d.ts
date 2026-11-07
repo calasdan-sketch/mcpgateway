@@ -17,6 +17,12 @@ export interface ResponseVerdict {
 /** Is the tool visible in listings? Hidden tools are also denied on call. */
 export declare function isHidden(policy: PolicyConfig, publicToolName: string): boolean;
 export declare function checkToolCall(policy: PolicyConfig, publicToolName: string, args: unknown): ToolVerdict;
+export interface ArgMatchOptions {
+    /** compare case-insensitively (deny "/etc/passwd" also stops "/ETC/Passwd"); also strips invisible characters and folds Unicode compatibility forms */
+    ignoreCase: boolean;
+    /** treat \\ as /, percent-decode (up to 3 layers), collapse "//", "/./" and "/../" before comparing; same invisible/Unicode folding as ignoreCase */
+    normalizePaths: boolean;
+}
 /**
  * Scan a tool result per response rules.
  *

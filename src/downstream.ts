@@ -34,7 +34,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { VERSION } from './version.js';
-import { sleep, withTimeout } from './util.js';
+import { sleep, stripHostile, withTimeout } from './util.js';
 import type { ServerConfig } from './config.js';
 
 export interface ServerCatalogs {
@@ -52,16 +52,26 @@ class Semaphore {
   get inFlight(): number {
     return this.active;
   }
-  async acquire(): Promise<() => void> {
+  /** Wait for a slot. An aborted signal leaves the queue immediately (a cancelled caller must not hold a place). */
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) throw new Error('request cancelled');
     if (this.active < this.max) {
       this.active += 1;
       return () => this.release();
     }
-    return new Promise<() => void>((resolve) => {
-      this.queue.push(() => {
+    return new Promise<() => void>((resolve, reject) => {
+      const entry = () => {
+        signal?.removeEventListener('abort', onAbort);
         this.active += 1;
         resolve(() => this.release());
-      });
+      };
+      const onAbort = () => {
+        const i = this.queue.indexOf(entry);
+        if (i !== -1) this.queue.splice(i, 1);
+        reject(new Error('request cancelled'));
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.queue.push(entry);
     });
   }
   private release(): void {
@@ -76,6 +86,41 @@ export interface DownstreamHooks {
   onCatalogChanged: (server: DownstreamServer) => void;
   /** A dead connection was re-established (stdio child restarted, etc.). */
   onReconnected?: (server: DownstreamServer) => void;
+  /** A sanitized line a stdio child wrote to stderr. Default: process.stderr. */
+  onChildStderr?: (server: string, line: string) => void;
+}
+
+/** Hard bounds so a server cannot make catalog fetching loop or balloon forever. */
+const MAX_CATALOG_PAGES = 200;
+const MAX_CATALOG_ITEMS = 20_000;
+const STDERR_LINE_MAX = 2_000;
+const STDERR_BUDGET_LINES = 1_000;
+const STDERR_BUDGET_WINDOW_MS = 10_000;
+const KILL_GRACE_MS = 2_000;
+
+/** Follow nextCursor to the end (bounded; a repeated cursor ends the walk). */
+export async function collectPages<T>(fetchPage: (cursor?: string) => Promise<{ items: T[]; nextCursor?: string | undefined }>): Promise<T[]> {
+  const out: T[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_CATALOG_PAGES; page++) {
+    const r = await fetchPage(cursor);
+    out.push(...r.items);
+    if (out.length >= MAX_CATALOG_ITEMS) return out.slice(0, MAX_CATALOG_ITEMS);
+    if (r.nextCursor === undefined || r.nextCursor === '' || seen.has(r.nextCursor)) return out;
+    seen.add(r.nextCursor);
+    cursor = r.nextCursor;
+  }
+  return out;
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
 }
 
 /** Test hook: a transport, or a factory producing a fresh one per (re)connect. */
@@ -95,6 +140,11 @@ export function isClientFault(e: unknown): boolean {
     e instanceof McpError &&
     (e.code === ErrorCode.InvalidParams || e.code === ErrorCode.MethodNotFound || e.code === ErrorCode.InvalidRequest || e.code === ErrorCode.ParseError)
   );
+}
+
+/** The caller gave up (client sent notifications/cancelled). The server did nothing wrong. */
+export function isCancellation(e: unknown): boolean {
+  return e instanceof Error && (e.message === 'request cancelled' || e.name === 'AbortError' || /^(MCP error -?\d+: )*(AbortError|This operation was aborted|Request cancelled)/i.test(e.message) || e.message === 'The operation was aborted.' || e.message === 'This operation was aborted');
 }
 
 export class DownstreamServer {
@@ -232,20 +282,67 @@ export class DownstreamServer {
 
   private createTransport(): Transport {
     if (this.cfg.transport === 'stdio') {
-      return new StdioClientTransport({
+      const t = new StdioClientTransport({
         command: this.cfg.command as string,
         args: this.cfg.args ?? [],
         env: this.cfg.env ?? {},
         cwd: this.cfg.cwd,
-        // inherit (not pipe): the SDK creates an undrained PassThrough for
-        // 'pipe', so a chatty server would block forever on a full stderr
-        // buffer. In stdio upstream mode stderr is our log channel anyway.
-        stderr: 'inherit',
+        // Piped, always drained, and sanitized: a server's stderr is untrusted
+        // text and must not reach the operator's terminal raw (escape
+        // sequences can rewrite the screen or hide lines).
+        stderr: 'pipe',
       });
+      this.pumpStderr(t);
+      return t;
     }
     return new StreamableHTTPClientTransport(new URL(this.cfg.url as string), {
       requestInit: { headers: this.cfg.headers ?? {} },
     });
+  }
+
+  private pumpStderr(t: StdioClientTransport): void {
+    const stream = t.stderr as import('node:stream').Readable | null | undefined;
+    if (stream === null || stream === undefined) return;
+    let partial = '';
+    let windowStart = Date.now();
+    let lines = 0;
+    let suppressed = 0;
+    const emit = (raw: string) => {
+      const now = Date.now();
+      if (now - windowStart > STDERR_BUDGET_WINDOW_MS) {
+        if (suppressed > 0) this.writeChildLine(`[${suppressed} stderr line(s) suppressed]`);
+        windowStart = now;
+        lines = 0;
+        suppressed = 0;
+      }
+      if (lines >= STDERR_BUDGET_LINES) {
+        suppressed += 1;
+        return;
+      }
+      lines += 1;
+      const clipped = raw.length > STDERR_LINE_MAX ? raw.slice(0, STDERR_LINE_MAX) + '…[truncated]' : raw;
+      this.writeChildLine(stripHostile(clipped).text.replace(/[\r\n]+/g, ' ⏎ '));
+    };
+    stream.setEncoding('utf8');
+    stream.on('data', (chunk: string) => {
+      partial += chunk;
+      let nl = partial.indexOf('\n');
+      while (nl !== -1) {
+        emit(partial.slice(0, nl).replace(/\r$/, ''));
+        partial = partial.slice(nl + 1);
+        nl = partial.indexOf('\n');
+      }
+      if (partial.length > STDERR_LINE_MAX * 2) {
+        emit(partial);
+        partial = '';
+      }
+    });
+    stream.on('error', () => undefined);
+  }
+
+  private writeChildLine(line: string): void {
+    if (this.hooks.onChildStderr) this.hooks.onChildStderr(this.name, line);
+    else process.stderr.write(`[${this.name}] ${line}\n`);
   }
 
   private registerCatalogWatchers(): void {
@@ -262,12 +359,40 @@ export class DownstreamServer {
 
   private async refreshCatalogs(notify = false): Promise<void> {
     try {
+      const caps = this.client.getServerCapabilities() ?? {};
+      // Listing is attempted whether or not the server declared the capability
+      // (some servers forget to); "method not found" just means empty. Any other
+      // failure on a kind the server DID declare KEEPS the previous catalog: one
+      // transient error must not make a server's tools vanish from every agent.
+      const prev = this.catalogs;
+      const errors: string[] = [];
+      const grab = async <T>(advertised: boolean, previous: T[], label: string, fetchPage: (cursor?: string) => Promise<{ items: T[]; nextCursor?: string | undefined }>): Promise<T[]> => {
+        try {
+          return await collectPages(fetchPage);
+        } catch (e) {
+          if (e instanceof McpError && e.code === ErrorCode.MethodNotFound) return [];
+          if (!advertised) return [];
+          errors.push(`${label}: ${(e as Error).message}`);
+          return previous;
+        }
+      };
       const [tools, resources, prompts] = await Promise.all([
-        this.client.listTools().catch(() => ({ tools: [] as Tool[] })),
-        this.client.listResources().catch(() => ({ resources: [] as Resource[] })),
-        this.client.listPrompts().catch(() => ({ prompts: [] as Prompt[] })),
+        grab(caps.tools !== undefined, prev.tools, 'tools/list', async (cursor) => {
+          const r = await this.client.listTools(cursor === undefined ? {} : { cursor });
+          return { items: r.tools, nextCursor: r.nextCursor };
+        }),
+        grab(caps.resources !== undefined, prev.resources, 'resources/list', async (cursor) => {
+          const r = await this.client.listResources(cursor === undefined ? {} : { cursor });
+          return { items: r.resources, nextCursor: r.nextCursor };
+        }),
+        grab(caps.prompts !== undefined, prev.prompts, 'prompts/list', async (cursor) => {
+          const r = await this.client.listPrompts(cursor === undefined ? {} : { cursor });
+          return { items: r.prompts, nextCursor: r.nextCursor };
+        }),
       ]);
-      this.catalogs = { tools: tools.tools, resources: resources.resources, prompts: prompts.prompts };
+      this.catalogs = { tools, resources, prompts };
+      if (errors.length > 0) this.lastError = `catalog refresh kept previous data (${errors.join('; ')})`;
+      else if (this.lastError?.startsWith('catalog refresh kept')) this.lastError = null;
       if (notify) this.hooks.onCatalogChanged(this);
     } catch (e) {
       this.lastError = (e as Error).message;
@@ -308,7 +433,7 @@ export class DownstreamServer {
    * Call a tool on this server. Enforces the circuit breaker, concurrency
    * bound, and per-call timeout. Throws on failure (caller maps to JSON-RPC).
    */
-  async callTool(originalName: string, args: unknown): Promise<CallToolResult> {
+  async callTool(originalName: string, args: unknown, signal?: AbortSignal): Promise<CallToolResult> {
     if (this.closed) throw new Error(`server "${this.name}" is closed`);
 
     // Circuit breaker.
@@ -320,11 +445,12 @@ export class DownstreamServer {
       }
     }
 
-    const release = await this.semaphore.acquire();
+    const release = await this.semaphore.acquire(signal);
     try {
       const result = (await withTimeout(
         this.client.callTool({ name: originalName, arguments: (args ?? {}) as Record<string, unknown> }, CallToolResultSchema, {
           timeout: this.cfg.timeoutMs,
+          ...(signal !== undefined ? { signal } : {}),
         }),
         this.cfg.timeoutMs + 5_000,
         `tool "${originalName}" on server "${this.name}"`,
@@ -388,7 +514,7 @@ export class DownstreamServer {
   }
 
   private onFailure(e: unknown): void {
-    if (isClientFault(e)) {
+    if (isClientFault(e) || isCancellation(e)) {
       // The server answered; it is alive. Don't count it, and let a half-open
       // probe close the breaker.
       this.onSuccess();
@@ -406,12 +532,26 @@ export class DownstreamServer {
     if (this.healthTimer) clearInterval(this.healthTimer);
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    const pid = this.transport instanceof StdioClientTransport ? this.transport.pid : null;
     try {
       await this.client.close();
     } catch {
       /* already gone */
     }
-    // Give the child a moment, then make sure a stuck stdio server dies with us.
-    await sleep(50);
+    // The SDK only sends SIGTERM. Give the child a grace period, then SIGKILL
+    // so a server that ignores SIGTERM cannot outlive the gateway as an orphan.
+    if (pid !== null && pid !== undefined) {
+      const deadline = Date.now() + KILL_GRACE_MS;
+      while (isAlive(pid) && Date.now() < deadline) await sleep(25);
+      if (isAlive(pid)) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          /* gone between check and kill */
+        }
+      }
+    } else {
+      await sleep(50);
+    }
   }
 }

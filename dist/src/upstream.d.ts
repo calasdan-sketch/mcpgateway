@@ -19,7 +19,7 @@
 import { type IncomingMessage, type Server as HttpServer } from 'node:http';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { type Prompt, type Resource } from '@modelcontextprotocol/sdk/types.js';
-import type { DownstreamServer } from './downstream.js';
+import { type DownstreamServer } from './downstream.js';
 import type { ToolEntry } from './namespace.js';
 import type { AuditLogger } from './audit.js';
 import type { Metrics } from './metrics.js';
@@ -114,8 +114,19 @@ export declare class GatewayUpstream {
     private handleHttp;
     private sweepSessions;
     private keyOf;
-    /** May this key see/call this public tool? (no key = stdio/anonymous = unrestricted here) */
+    /** Is this server inside the key's allowServers? (no key / no restriction = yes) */
+    private serverAllowed;
+    /** May this key see/call this tool? (no key = stdio/anonymous = unrestricted here) */
     private visibleTo;
+    private authFailWindowStart;
+    private authFailLogged;
+    private authFailSuppressed;
+    /**
+     * Record a rejected request. Counted always; written to the audit log at
+     * most 30 times a minute (a flood of bad keys must not fill the log), with
+     * a summary record of what was dropped when the window rolls over.
+     */
+    private authFailure;
     /** Per-key budget across all tools/resources/prompts. true = allowed. */
     private keyBudgetOk;
     private handleSearch;

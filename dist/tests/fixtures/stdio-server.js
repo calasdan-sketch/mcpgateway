@@ -6,6 +6,13 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
+// Test switches: hostile stderr, a child that ignores SIGTERM, and its pid on stderr.
+if (process.env['FIXTURE_STDERR_ESC'] === '1')
+    process.stderr.write('\u001b[31mred\u001b[0m\u001b]0;pwned\u0007 \u202eevil\r\n');
+if (process.env['FIXTURE_IGNORE_SIGTERM'] === '1')
+    process.on('SIGTERM', () => undefined);
+if (process.env['FIXTURE_PRINT_PID'] === '1')
+    process.stderr.write(`PID:${process.pid}\n`);
 const extra = Number(process.env['FIXTURE_TOOLS'] ?? '0');
 const server = new Server({ name: 'fixture', version: '1.0.0' }, { capabilities: { tools: {} } });
 const schema = { type: 'object', properties: { text: { type: 'string', description: 'text to echo' } } };

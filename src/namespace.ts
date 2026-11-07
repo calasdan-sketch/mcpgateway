@@ -21,6 +21,10 @@ export interface CatalogTool {
   name: string;
   description?: string;
   inputSchema?: unknown;
+  /** MCP tool annotations (readOnlyHint, destructiveHint, ...). Server-claimed, so pinned. */
+  annotations?: Record<string, unknown>;
+  outputSchema?: unknown;
+  title?: string;
 }
 
 export interface ServerCatalog {
@@ -204,6 +208,9 @@ export function buildNamespace(catalogs: ServerCatalog[], cfg: NamespaceConfig):
       description: tool.description,
       inputSchema: tool.inputSchema,
     };
+    if (tool.annotations !== undefined) entry.annotations = tool.annotations;
+    if (tool.outputSchema !== undefined) entry.outputSchema = tool.outputSchema;
+    if (tool.title !== undefined) entry.title = tool.title;
     tools.push(entry);
     byPublicName.set(publicName, entry);
   }

@@ -34,6 +34,8 @@ export interface StartOptions {
     transportOverrides?: Map<string, import('./downstream.js').TransportOverride>;
     /** Skip starting the admin HTTP API (tests). */
     noAdmin?: boolean;
+    /** Test hook: receives sanitized stderr lines from stdio children instead of process.stderr. */
+    onChildStderr?: (server: string, line: string) => void;
     /** Where operational logs go (stderr in stdio mode). Defaults to console. */
     log?: (msg: string) => void;
     /** Started HTTP upstream server, if enabled. */

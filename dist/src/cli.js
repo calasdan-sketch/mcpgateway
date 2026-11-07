@@ -12,6 +12,9 @@ import { startGateway } from './gateway.js';
 import { buildNamespace } from './namespace.js';
 import { DownstreamServer } from './downstream.js';
 import { verifyChain } from './audit.js';
+import { randomBytes } from 'node:crypto';
+import { checkToolCall, isHidden } from './policy.js';
+import { globMatch, hashKey } from './util.js';
 import { VERSION } from './version.js';
 const HELP = `mcpgateway ${VERSION} — one process fronting all your MCP servers.
 
@@ -23,6 +26,10 @@ Usage:
   mcpgateway init [-o out.yaml]         Write a commented starter config
   mcpgateway audit-verify <audit.jsonl> [--key-env VAR]
                                         Verify the audit hash chain (includes rotated .N files)
+  mcpgateway policy-test --tool NAME [--args JSON] [--key ID] [-c config.yaml]
+                                        Ask the policy what it would do with a call (offline; no servers started)
+  mcpgateway hash-key [--generate | --key-env VAR]
+                                        Print a sha256 keyHash for the config (key from stdin, env, or freshly generated)
   mcpgateway --version | --help
 
 Options:
@@ -35,7 +42,7 @@ Options:
 Docs: https://github.com/calasdan-sketch/mcpgateway (when published)
 `;
 function parseArgs(argv) {
-    const args = { command: '', config: './mcpgateway.yaml', network: false, http: false, output: './mcpgateway.yaml', force: false, rest: [] };
+    const args = { command: '', config: './mcpgateway.yaml', network: false, http: false, output: './mcpgateway.yaml', force: false, rest: [], generate: false };
     const rest = [];
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
@@ -51,6 +58,14 @@ function parseArgs(argv) {
             args.force = true;
         else if (a === '--key-env')
             args.keyEnv = argv[++i];
+        else if (a === '--tool')
+            args.tool = argv[++i];
+        else if (a === '--args')
+            args.toolArgs = argv[++i];
+        else if (a === '--key')
+            args.keyId = argv[++i];
+        else if (a === '--generate')
+            args.generate = true;
         else if (a === '--version' || a === '-V')
             return { ...args, command: 'version' };
         else if (a === '--help' || a === '-h')
@@ -107,6 +122,12 @@ export async function main(argv) {
         case 'audit-verify':
             cmdAuditVerify(args);
             return;
+        case 'policy-test':
+            cmdPolicyTest(args);
+            return;
+        case 'hash-key':
+            await cmdHashKey(args);
+            return;
         default:
             console.error(`unknown command "${args.command}" (see --help)`);
             process.exitCode = 2;
@@ -117,6 +138,9 @@ async function cmdServe(args) {
     applyServeFlags(cfg, args);
     if (cfg.auth.disabled) {
         console.error('[mcpgateway] WARNING: auth.disabled=true — HTTP upstream and admin accept unauthenticated requests');
+    }
+    if (cfg.admin.enabled && cfg.auth.disabled && cfg.admin.host !== '127.0.0.1' && cfg.admin.host !== 'localhost' && cfg.admin.host !== '::1') {
+        console.error('[mcpgateway] WARNING: admin API is bound beyond loopback with auth.disabled=true — anyone who can reach it can accept pins and reload. Configure auth.keys.');
     }
     if (cfg.admin.enabled && cfg.admin.allowPublicAdmin) {
         console.error('[mcpgateway] WARNING: admin.allowPublicAdmin=true — admin API is reachable beyond localhost');
@@ -221,6 +245,88 @@ function cmdAuditVerify(args) {
     console.log(`ok: ${r.records} record(s) in ${files.length} file(s); chain starts from ${r.anchor ?? 'n/a'}`);
     if (r.head)
         console.log(`head: seq=${r.head.seq} hash=${r.head.hash}  (compare with GET /v1/audit/head stored elsewhere to detect truncation)`);
+}
+function cmdPolicyTest(args) {
+    if (args.tool === undefined) {
+        console.error('error: usage: mcpgateway policy-test --tool NAME [--args \'{"path":"/etc/passwd"}\'] [--key ID] [-c config.yaml]');
+        process.exitCode = 2;
+        return;
+    }
+    let callArgs = {};
+    if (args.toolArgs !== undefined) {
+        try {
+            callArgs = JSON.parse(args.toolArgs);
+        }
+        catch {
+            console.error('error: --args must be valid JSON');
+            process.exitCode = 2;
+            return;
+        }
+    }
+    const cfg = loadConfigOrExit(args.config, true);
+    const tool = args.tool;
+    const notes = [];
+    if (isHidden(cfg.policy, tool)) {
+        console.log(`DENY  "${tool}" is hidden by policy.hideTools (callers see "unknown tool")`);
+        process.exitCode = 1;
+        return;
+    }
+    if (args.keyId !== undefined) {
+        const k = cfg.auth.keys.find((x) => x.id === args.keyId);
+        if (k === undefined) {
+            console.error(`error: no key with id "${args.keyId}" in the config`);
+            process.exitCode = 2;
+            return;
+        }
+        if (k.denyTools?.some((g) => globMatch(g, tool)) || (k.allowTools !== undefined && !k.allowTools.some((g) => globMatch(g, tool)))) {
+            console.log(`DENY  key "${k.id}" may not use "${tool}" (allowTools/denyTools; callers see "unknown tool")`);
+            process.exitCode = 1;
+            return;
+        }
+        if (k.readOnly)
+            notes.push('key is readOnly: also needs readOnlyHint:true from the server (needs the live catalog, check with `namespace`)');
+        if (k.allowServers)
+            notes.push(`key is limited to servers ${k.allowServers.join(', ')} (needs the live catalog, check with \`namespace\`)`);
+        if (!k.scopes.includes('tools:call'))
+            notes.push('key has no tools:call scope: HTTP calls are refused before policy runs');
+    }
+    const v = checkToolCall(cfg.policy, tool, callArgs);
+    const observe = cfg.policy.mode === 'observe';
+    if (v.decision === 'deny') {
+        console.log(`${observe ? 'WOULD DENY (observe mode, call is forwarded)' : 'DENY'}  ${v.reason}: ${v.detail}`);
+        for (const n of notes)
+            console.log(`note: ${n}`);
+        process.exitCode = observe ? 0 : 1;
+        return;
+    }
+    console.log(`ALLOW  fleet policy lets "${tool}" through`);
+    for (const n of notes)
+        console.log(`note: ${n}`);
+}
+async function cmdHashKey(args) {
+    let key;
+    let generated = false;
+    if (args.generate) {
+        key = randomBytes(32).toString('hex');
+        generated = true;
+    }
+    else if (args.keyEnv !== undefined) {
+        key = process.env[args.keyEnv];
+    }
+    else if (!process.stdin.isTTY) {
+        const chunks = [];
+        for await (const c of process.stdin)
+            chunks.push(c);
+        key = Buffer.concat(chunks).toString('utf8').replace(/\r?\n$/, '');
+    }
+    if (key === undefined || key.length < 16) {
+        console.error('error: give a key of at least 16 characters on stdin, via --key-env VAR, or use --generate');
+        process.exitCode = 2;
+        return;
+    }
+    if (generated)
+        console.log(`key (give this to the client, it is not stored anywhere): ${key}`);
+    console.log(`keyHash: ${hashKey(key)}`);
 }
 function cmdInit(args) {
     if (existsSync(args.output) && !args.force) {

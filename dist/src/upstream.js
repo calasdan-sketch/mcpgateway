@@ -22,9 +22,10 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, GetPromptRequestSchema, ListPromptsRequestSchema, ListResourcesRequestSchema, ListToolsRequestSchema, McpError, ReadResourceRequestSchema, ErrorCode, } from '@modelcontextprotocol/sdk/types.js';
-import { collectSecretValues, redactSecretValues } from './audit.js';
+import { isCancellation } from './downstream.js';
+import { collectSecretValues, redactSecretValues, redactText } from './audit.js';
 import { checkResponse, checkToolCall, isHidden } from './policy.js';
-import { globMatch, matchKey, newRequestId, safeJsonStringify, truncate } from './util.js';
+import { globMatch, matchKey, newRequestId, safeJsonStringify, stripHostile, truncate } from './util.js';
 import { VERSION } from './version.js';
 export const RESOURCE_SCHEME = 'mcpgateway';
 export function publicResourceUri(server, originalUri) {
@@ -102,6 +103,8 @@ export function checkHostOrigin(cfg, hostHeader, originHeader) {
 // Gateway
 // ---------------------------------------------------------------------------
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
+/** JSON-RPC batch cap: processing cost grew faster than linearly (5,000 pings took 4 s). */
+const MAX_BATCH = 100;
 export class GatewayUpstream {
     deps;
     inflight = 0;
@@ -121,20 +124,17 @@ export class GatewayUpstream {
                 tools.push(...metaTools());
             }
             for (const entry of table.toolMeta.values()) {
-                if (this.visibleTo(keyId, entry.publicName) === false)
+                if (this.visibleTo(keyId, entry) === false)
                     continue;
                 if (this.deps.exposure?.mode === 'search' && !this.deps.exposure.alwaysExpose.some((g) => globMatch(g, entry.publicName)))
                     continue;
-                tools.push({
-                    name: entry.publicName,
-                    description: entry.description,
-                    inputSchema: (entry.inputSchema ?? { type: 'object' }),
-                });
+                tools.push(toolForClient(entry));
             }
             return { tools };
         });
-        server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             const name = request.params.name;
+            const signal = extra.signal;
             const args = request.params.arguments ?? {};
             if (this.deps.exposure?.mode === 'search') {
                 if (name === META_SEARCH)
@@ -148,14 +148,18 @@ export class GatewayUpstream {
                     if (a.arguments !== undefined && (a.arguments === null || typeof a.arguments !== 'object' || Array.isArray(a.arguments))) {
                         throw new McpError(ErrorCode.InvalidParams, `${META_CALL} "arguments" must be an object`);
                     }
-                    return this.handleToolCall(a.name, a.arguments ?? {}, ctxOf());
+                    return this.handleToolCall(a.name, a.arguments ?? {}, ctxOf(), signal);
                 }
             }
-            return this.handleToolCall(name, args, ctxOf());
+            return this.handleToolCall(name, args, ctxOf(), signal);
         });
         server.setRequestHandler(ListResourcesRequestSchema, async () => {
             const table = this.deps.getTable();
-            return { resources: [...table.resourceMeta.values()] };
+            const keyId = ctxOf().keyId;
+            const resources = [...table.resourceMeta.entries()]
+                .filter(([uri]) => this.serverAllowed(keyId, table.resources.get(uri)?.server.name))
+                .map(([, r]) => r);
+            return { resources };
         });
         server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
             return this.handleResourceRead(request.params.uri, ctxOf());
@@ -163,7 +167,10 @@ export class GatewayUpstream {
         server.setRequestHandler(ListPromptsRequestSchema, async () => {
             const table = this.deps.getTable();
             const prompts = [];
+            const keyId = ctxOf().keyId;
             for (const meta of table.promptMeta.values()) {
+                if (!this.serverAllowed(keyId, meta.server))
+                    continue;
                 prompts.push({ name: meta.publicName, description: meta.description, arguments: meta.args });
             }
             return { prompts };
@@ -207,6 +214,7 @@ export class GatewayUpstream {
         // DNS-rebinding / cross-origin defense (MCP spec: servers MUST validate Origin).
         const hostProblem = checkHostOrigin(this.deps.http ?? { host: '127.0.0.1', allowedHosts: [], allowedOrigins: [] }, req.headers['host'], typeof req.headers['origin'] === 'string' ? req.headers['origin'] : undefined);
         if (hostProblem !== null) {
+            this.authFailure('bad_host', req, hostProblem);
             res.writeHead(403, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ error: hostProblem }));
             return;
@@ -214,6 +222,7 @@ export class GatewayUpstream {
         // Edge auth for every HTTP request (GET/POST/DELETE alike).
         const authed = this.authenticateHttp(req);
         if (authed === null) {
+            this.authFailure('bad_key', req, 'missing, invalid or expired bearer token');
             res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer' });
             res.end(JSON.stringify({ error: 'missing or invalid bearer token' }));
             return;
@@ -224,6 +233,11 @@ export class GatewayUpstream {
                 return; // error already written
             const body = parsedBody;
             const items = Array.isArray(body) ? body : [body];
+            if (items.length > MAX_BATCH) {
+                res.writeHead(413, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ error: `batch of ${items.length} messages exceeds the limit of ${MAX_BATCH}` }));
+                return;
+            }
             if (items.length === 0 || items.some((m) => m === null || typeof m !== 'object' || Array.isArray(m))) {
                 res.writeHead(400, { 'content-type': 'application/json' });
                 res.end(JSON.stringify({ error: 'body must be a JSON-RPC message or a non-empty array of them' }));
@@ -233,6 +247,7 @@ export class GatewayUpstream {
             for (const method of methods) {
                 const scope = scopeForMethod(typeof method === 'string' ? method : '');
                 if (scope !== null && !authed.scopes.includes(scope)) {
+                    this.authFailure('missing_scope', req, `key "${authed.keyId}" lacks scope "${scope}"`, authed.keyId);
                     res.writeHead(403, { 'content-type': 'application/json' });
                     res.end(JSON.stringify({ error: `key "${authed.keyId}" lacks scope "${scope}"` }));
                     return;
@@ -242,6 +257,7 @@ export class GatewayUpstream {
             const existing = sessionId !== undefined ? sessions.get(sessionId) : undefined;
             if (existing !== undefined && existing.keyId !== authed.keyId) {
                 // A session belongs to the key that opened it.
+                this.authFailure('wrong_session_key', req, 'session belongs to a different key', authed.keyId);
                 res.writeHead(403, { 'content-type': 'application/json' });
                 res.end(JSON.stringify({ error: 'session belongs to a different key' }));
                 return;
@@ -294,6 +310,7 @@ export class GatewayUpstream {
                 return;
             }
             if (entry.keyId !== authed.keyId) {
+                this.authFailure('wrong_session_key', req, 'session belongs to a different key', authed.keyId);
                 res.writeHead(403, { 'content-type': 'application/json' });
                 res.end(JSON.stringify({ error: 'session belongs to a different key' }));
                 return;
@@ -319,8 +336,16 @@ export class GatewayUpstream {
     keyOf(keyId) {
         return keyId === undefined ? undefined : this.deps.auth.keys.find((k) => k.id === keyId);
     }
-    /** May this key see/call this public tool? (no key = stdio/anonymous = unrestricted here) */
-    visibleTo(keyId, publicName) {
+    /** Is this server inside the key's allowServers? (no key / no restriction = yes) */
+    serverAllowed(keyId, server) {
+        const k = this.keyOf(keyId);
+        if (k?.allowServers === undefined)
+            return true;
+        return server !== undefined && k.allowServers.some((g) => globMatch(g, server));
+    }
+    /** May this key see/call this tool? (no key = stdio/anonymous = unrestricted here) */
+    visibleTo(keyId, entry) {
+        const publicName = entry.publicName;
         if (isHidden(this.deps.policy, publicName))
             return false;
         const k = this.keyOf(keyId);
@@ -330,7 +355,44 @@ export class GatewayUpstream {
             return false;
         if (k.allowTools !== undefined && !k.allowTools.some((g) => globMatch(g, publicName)))
             return false;
+        if (!this.serverAllowed(keyId, entry.server))
+            return false;
+        // Fail closed: a tool is read-only only if its server said so explicitly.
+        if (k.readOnly === true && entry.annotations?.['readOnlyHint'] !== true)
+            return false;
         return true;
+    }
+    authFailWindowStart = 0;
+    authFailLogged = 0;
+    authFailSuppressed = 0;
+    /**
+     * Record a rejected request. Counted always; written to the audit log at
+     * most 30 times a minute (a flood of bad keys must not fill the log), with
+     * a summary record of what was dropped when the window rolls over.
+     */
+    authFailure(reason, req, detail, keyId) {
+        this.deps.metrics.authFailures.inc({ reason });
+        const now = Date.now();
+        if (now - this.authFailWindowStart > 60_000) {
+            if (this.authFailSuppressed > 0) {
+                this.deps.audit.log({
+                    ts: new Date().toISOString(), reqId: newRequestId(), tool: '(edge)', server: 'gateway', originalTool: '(edge)', durationMs: 0,
+                    status: 'auth_failed', errorCode: 'suppressed', errorMessage: `${this.authFailSuppressed} further rejected request(s) not logged in the previous minute`,
+                });
+            }
+            this.authFailWindowStart = now;
+            this.authFailLogged = 0;
+            this.authFailSuppressed = 0;
+        }
+        if (this.authFailLogged >= 30) {
+            this.authFailSuppressed += 1;
+            return;
+        }
+        this.authFailLogged += 1;
+        this.deps.audit.log({
+            ts: new Date(now).toISOString(), reqId: newRequestId(), keyId, tool: '(edge)', server: 'gateway', originalTool: '(edge)', durationMs: 0,
+            status: 'auth_failed', errorCode: reason, errorMessage: `${detail} (from ${req.socket.remoteAddress ?? 'unknown'})`,
+        });
     }
     /** Per-key budget across all tools/resources/prompts. true = allowed. */
     keyBudgetOk(keyId) {
@@ -351,7 +413,7 @@ export class GatewayUpstream {
         const tokens = a.query.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 0).slice(0, 20);
         const scored = [];
         for (const entry of this.deps.getTable().toolMeta.values()) {
-            if (!this.visibleTo(ctx.keyId, entry.publicName))
+            if (!this.visibleTo(ctx.keyId, entry))
                 continue;
             const name = entry.publicName.toLowerCase();
             const desc = (entry.description ?? '').toLowerCase();
@@ -368,11 +430,10 @@ export class GatewayUpstream {
                 scored.push({ score, entry });
         }
         scored.sort((x, y) => y.score - x.score || (x.entry.publicName < y.entry.publicName ? -1 : 1));
-        const results = scored.slice(0, limit).map(({ entry }) => ({
-            name: entry.publicName,
-            description: entry.description,
-            inputSchema: entry.inputSchema ?? { type: 'object' },
-        }));
+        const results = scored.slice(0, limit).map(({ entry }) => {
+            const t = toolForClient(entry);
+            return { name: t.name, description: t.description, inputSchema: t.inputSchema, ...(t.annotations ? { annotations: t.annotations } : {}) };
+        });
         this.deps.audit.log({
             ts: new Date().toISOString(),
             reqId: newRequestId(),
@@ -400,7 +461,7 @@ export class GatewayUpstream {
         return k === null ? null : { keyId: k.id, scopes: k.scopes };
     }
     // -- tool call pipeline ----------------------------------------------------------
-    async handleToolCall(publicName, args, ctx) {
+    async handleToolCall(publicName, args, ctx, signal) {
         const { metrics, audit } = this.deps;
         const reqId = newRequestId();
         const t0 = Date.now();
@@ -443,6 +504,7 @@ export class GatewayUpstream {
                 ...extra,
             });
             metrics.toolCalls.inc({ server: target.server.name, tool: publicName, status });
+            metrics.keyCalls.inc({ key: ctx.keyId ?? 'none', status });
             metrics.toolDuration.observe({ server: target.server.name, tool: publicName }, durationMs / 1000);
         };
         // 2. Hidden tools are denied unconditionally: hiding is access control,
@@ -458,7 +520,8 @@ export class GatewayUpstream {
         }
         // 2b. Per-key ACL: a key that may not see a tool gets the same masked
         // "unknown tool" error as for a hidden one.
-        if (!this.visibleTo(ctx.keyId, publicName)) {
+        const meta = table.toolMeta.get(publicName);
+        if (meta === undefined || !this.visibleTo(ctx.keyId, meta)) {
             metrics.policyDenials.inc({ tool: publicName, reason: 'key_acl' });
             finish('denied', { policyReason: 'key_acl', errorMessage: `tool "${publicName}" is not permitted for key "${ctx.keyId ?? ''}"` });
             throw new McpError(ErrorCode.InvalidParams, `unknown tool "${truncateName(publicName)}"`);
@@ -503,7 +566,7 @@ export class GatewayUpstream {
         // still be audited and scrubbed (the SDK wraps them in McpError too).
         let alreadyAudited = false;
         try {
-            const result = await target.server.callTool(target.original, args);
+            const result = await target.server.callTool(target.original, args, signal);
             // 5b. Result-size guard: a malicious or buggy server must not OOM the
             // gateway with a giant payload. (Servers are operator-trusted, but
             // bugs happen; fail the call, not the process.)
@@ -538,7 +601,13 @@ export class GatewayUpstream {
             if (e instanceof McpError && alreadyAudited)
                 throw e;
             const message = (e instanceof Error ? e.message : String(e)).replace(/^(MCP error -?\d+: )+/, '');
-            const scrubbed = scrub(message);
+            const scrubbed = redactText(scrub(message));
+            const cancelled = signal?.aborted === true || isCancellation(e);
+            if (cancelled) {
+                metrics.cancelled.inc({});
+                finish('error', { errorCode: 'cancelled', errorMessage: 'cancelled by the client' });
+                throw new McpError(-32000, `tool "${publicName}" was cancelled`);
+            }
             const timedOut = /timed out/i.test(scrubbed);
             // Preserve the downstream JSON-RPC code when there is one (more
             // truthful than flattening everything to -32000).
@@ -564,6 +633,9 @@ export class GatewayUpstream {
         const table = this.deps.getTable();
         const target = parsed !== null ? table.resources.get(publicUri) : undefined;
         if (target === undefined || parsed === null) {
+            throw new McpError(ErrorCode.InvalidParams, `unknown resource "${truncateName(publicUri)}"`);
+        }
+        if (!this.serverAllowed(ctx.keyId, target.server.name)) {
             throw new McpError(ErrorCode.InvalidParams, `unknown resource "${truncateName(publicUri)}"`);
         }
         if (!this.keyBudgetOk(ctx.keyId))
@@ -628,6 +700,9 @@ export class GatewayUpstream {
         const table = this.deps.getTable();
         const target = table.prompts.get(publicName);
         if (target === undefined) {
+            throw new McpError(ErrorCode.InvalidParams, `unknown prompt "${truncateName(publicName)}"`);
+        }
+        if (!this.serverAllowed(ctx.keyId, target.server.name)) {
             throw new McpError(ErrorCode.InvalidParams, `unknown prompt "${truncateName(publicName)}"`);
         }
         if (!this.keyBudgetOk(ctx.keyId))
@@ -728,8 +803,24 @@ function metaTools() {
         },
     ];
 }
+/** The tools/list shape for one tool, including what clients use to decide (annotations, outputSchema, title). */
+function toolForClient(entry) {
+    const t = {
+        name: entry.publicName,
+        description: entry.description,
+        inputSchema: (entry.inputSchema ?? { type: 'object' }),
+    };
+    if (entry.annotations !== undefined)
+        t.annotations = entry.annotations;
+    if (entry.outputSchema !== undefined)
+        t.outputSchema = entry.outputSchema;
+    if (entry.title !== undefined)
+        t.title = entry.title;
+    return t;
+}
 function truncateName(name) {
-    return name.length > 120 ? name.slice(0, 120) + '…' : name;
+    const clean = stripHostile(name).text;
+    return clean.length > 120 ? clean.slice(0, 120) + '…' : clean;
 }
 /** Sentinel: JSON `null` is a valid body, so failure needs its own marker (a bare null used to leave the request hanging). */
 const FAILED = Symbol('body-failed');
@@ -760,13 +851,18 @@ function readBody(req, res) {
         req.on('end', () => {
             if (done)
                 return;
-            done = true;
+            let parsed;
             try {
-                resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+                parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
             }
             catch {
+                // fail() must run while `done` is still false, or the client is never answered
+                // (0.3.0 left a request with an empty or truncated JSON body hanging forever).
                 fail(400, 'invalid JSON body');
+                return;
             }
+            done = true;
+            resolve(parsed);
         });
         req.on('error', () => fail(400, 'error reading body'));
     });

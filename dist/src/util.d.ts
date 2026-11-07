@@ -23,9 +23,14 @@ export declare function globMatch(pattern: string, value: string): boolean;
  */
 export declare function matchKey<K extends {
     key: string;
-}>(keys: K[], presented: string): K | null;
+    keyHash?: string;
+    expiresAt?: number;
+}>(keys: K[], presented: string, now?: number): K | null;
+/** The value to put in `keyHash:` for a key. */
+export declare function hashKey(key: string): string;
 export declare function stripHostile(s: string): {
     text: string;
     changed: boolean;
 };
+export declare function escapeHostileJson(line: string): string;
 //# sourceMappingURL=util.d.ts.map

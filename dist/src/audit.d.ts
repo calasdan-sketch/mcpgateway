@@ -53,8 +53,10 @@ export declare class AuditLogger {
     private prepare;
     private rotate;
 }
+/** Replace known credential shapes inside free text. */
+export declare function redactText(text: string): string;
 /** Recursively redact values whose key contains a redact substring (case-insensitive). */
-export declare function redactDeep(value: unknown, redactKeys: string[]): unknown;
+export declare function redactDeep(value: unknown, redactKeys: string[], shapes?: boolean): unknown;
 /**
  * Collect the actual secret VALUES from a call's args (values of keys that
  * matched the redact list). Used to scrub those values out of downstream

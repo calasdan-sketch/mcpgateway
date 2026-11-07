@@ -6,7 +6,7 @@
  * still sanity-checks commands exist and warns on cleartext remote URLs.
  */
 import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
-import { delimiter as pathDelimiter } from 'node:path';
+import { delimiter as pathDelimiter, join as joinPath } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { globMatch } from './util.js';
 
@@ -72,6 +72,8 @@ export interface PolicyConfig {
   responseBlock: string[];
   responseWarn: string[];
   scanWindowChars: number;
+  /** How argRules substrings are compared (defaults: exact, case-sensitive; both off) */
+  argMatch?: { ignoreCase: boolean; normalizePaths: boolean };
   /** Rug-pull defense: pin each tool's description+schema hash (trust on first use). */
   pinning?: PinningConfig;
 }
@@ -85,7 +87,16 @@ export interface PinningConfig {
 
 export interface AuthKey {
   id: string;
+  /** plaintext key (empty when keyHash is used) */
   key: string;
+  /** "sha256:<64 hex>" digest of the key — the config then never holds the secret (see `mcpgateway hash-key`) */
+  keyHash?: string;
+  /** key stops working at this instant (ISO 8601); checked on every request */
+  expiresAt?: number;
+  /** only tools whose server-declared annotations say readOnlyHint: true are visible/callable; no hint = not read-only */
+  readOnly?: boolean;
+  /** restrict tools, resources and prompts to these servers (globs over server names) */
+  allowServers?: string[];
   scopes: string[];
   /** per-key tool visibility (globs over public names); deny wins. Omitted = everything policy allows. */
   allowTools?: string[];
@@ -110,6 +121,8 @@ export interface AuditConfig {
   keepFiles: number;
   /** tamper-evident hash chain over records (see `mcpgateway audit-verify`) */
   chain?: boolean;
+  /** redact well-known credential shapes (bearer tokens, JWTs, sk-/ghp_/AKIA/xox keys, PEM headers, URL passwords) inside any string value. Default true. */
+  redactValues?: boolean;
   /** optional HMAC secret for the chain; without it an attacker who can rewrite the file can recompute hashes */
   chainKey?: string;
 }
@@ -119,6 +132,8 @@ export interface AdminConfig {
   host: string;
   port: number;
   allowPublicAdmin: boolean;
+  /** accepted Host header names (DNS-rebinding defense). Loopback binds default to loopback names only. */
+  allowedHosts: string[];
 }
 
 export interface UpstreamConfig {
@@ -458,7 +473,22 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
     p.push(ctx('policy.mode must be enforce|observe'));
     policy.mode = 'enforce';
   }
-  checkKnown(polRaw, ['mode', 'allowTools', 'denyTools', 'hideTools', 'argRules', 'responseRedact', 'responseBlock', 'responseWarn', 'scanWindowChars', 'pinning'], ctx('policy'), true, p);
+  checkKnown(polRaw, ['mode', 'allowTools', 'denyTools', 'hideTools', 'argRules', 'responseRedact', 'responseBlock', 'responseWarn', 'scanWindowChars', 'pinning', 'argMatch'], ctx('policy'), true, p);
+  const argMatch = { ignoreCase: false, normalizePaths: false };
+  policy.argMatch = argMatch;
+  const amRaw = polRaw['argMatch'];
+  if (amRaw !== undefined) {
+    if (!isRaw(amRaw)) p.push(ctx('policy.argMatch must be {ignoreCase?, normalizePaths?}'));
+    else {
+      checkKnown(amRaw, ['ignoreCase', 'normalizePaths'], ctx('policy.argMatch'), true, p);
+      for (const k of ['ignoreCase', 'normalizePaths'] as const) {
+        const v = amRaw[k];
+        if (v === undefined) continue;
+        if (typeof v !== 'boolean') p.push(ctx(`policy.argMatch.${k} must be boolean`));
+        else argMatch[k] = v;
+      }
+    }
+  }
   const pinning: PinningConfig = { mode: 'off' };
   policy.pinning = pinning;
   const pinRaw = polRaw['pinning'];
@@ -519,9 +549,24 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
           p.push(`${kc}: must be a mapping`);
           return;
         }
-        checkKnown(k, ['id', 'key', 'scopes', 'allowTools', 'denyTools', 'rateLimit'], kc, true, p);
+        checkKnown(k, ['id', 'key', 'keyHash', 'scopes', 'allowTools', 'denyTools', 'rateLimit', 'expiresAt', 'readOnly', 'allowServers'], kc, true, p);
         const id = reqStr(k, 'id', kc, p);
-        const key = reqStr(k, 'key', kc, p);
+        let key = '';
+        let keyHash: string | undefined;
+        if (k['key'] !== undefined && k['keyHash'] !== undefined) p.push(`${kc}: set either "key" or "keyHash", not both`);
+        else if (k['keyHash'] !== undefined) {
+          if (!str(k['keyHash']) || !/^sha256:[0-9a-f]{64}$/.test(k['keyHash'])) p.push(`${kc}: "keyHash" must look like sha256:<64 lowercase hex> (make one with: mcpgateway hash-key)`);
+          else keyHash = k['keyHash'];
+        } else key = reqStr(k, 'key', kc, p) ?? '';
+        let expiresAt: number | undefined;
+        if (k['expiresAt'] !== undefined) {
+          const raw = k['expiresAt'];
+          const t = raw instanceof Date ? raw.getTime() : str(raw) ? Date.parse(raw) : Number.NaN;
+          if (Number.isNaN(t)) p.push(`${kc}: "expiresAt" must be an ISO 8601 date/time (e.g. 2027-01-31T00:00:00Z)`);
+          else expiresAt = t;
+        }
+        if (k['readOnly'] !== undefined && typeof k['readOnly'] !== 'boolean') p.push(`${kc}: "readOnly" must be boolean`);
+        const keyServers = k['allowServers'] === undefined ? undefined : strArray(k, 'allowServers', kc, p);
         const keyAllow = k['allowTools'] === undefined ? undefined : strArray(k, 'allowTools', kc, p);
         const keyDeny = k['denyTools'] === undefined ? undefined : strArray(k, 'denyTools', kc, p);
         const keyRate = k['rateLimit'] === undefined ? undefined : rateLimit(k['rateLimit'], `${kc}.rateLimit`, p);
@@ -537,9 +582,13 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
             else scopes.push(s);
           }
         }
-        if (id && key) {
-          if (key.length < 16) p.push(`${kc}: key is shorter than 16 chars — use a long random secret`);
+        if (id && (key || keyHash)) {
+          if (key && key.length < 16) p.push(`${kc}: key is shorter than 16 chars — use a long random secret`);
           const entry: AuthKey = { id, key, scopes };
+          if (keyHash !== undefined) entry.keyHash = keyHash;
+          if (expiresAt !== undefined) entry.expiresAt = expiresAt;
+          if (k['readOnly'] === true) entry.readOnly = true;
+          if (keyServers !== undefined) entry.allowServers = keyServers;
           if (keyAllow !== undefined) entry.allowTools = keyAllow;
           if (keyDeny !== undefined) entry.denyTools = keyDeny;
           if (keyRate !== undefined) entry.rateLimit = keyRate;
@@ -562,8 +611,13 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
     maxSizeMB: 100,
     keepFiles: 5,
     chain: false,
+    redactValues: true,
   };
-  checkKnown(audRaw, ['path', 'logArgs', 'redactKeys', 'maxArgsChars', 'maxSizeMB', 'keepFiles', 'chain', 'chainKey'], ctx('audit'), false, p);
+  checkKnown(audRaw, ['path', 'logArgs', 'redactKeys', 'maxArgsChars', 'maxSizeMB', 'keepFiles', 'chain', 'chainKey', 'redactValues'], ctx('audit'), false, p);
+  if (audRaw['redactValues'] !== undefined) {
+    if (typeof audRaw['redactValues'] !== 'boolean') p.push(ctx('audit.redactValues must be boolean'));
+    else audit.redactValues = audRaw['redactValues'];
+  }
   if (audRaw['chain'] !== undefined) {
     if (typeof audRaw['chain'] !== 'boolean') p.push(ctx('audit.chain must be boolean'));
     else audit.chain = audRaw['chain'];
@@ -597,6 +651,7 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
     host: '127.0.0.1',
     port: 3001,
     allowPublicAdmin: false,
+    allowedHosts: [],
   };
   if (admRaw['enabled'] !== undefined) {
     if (typeof admRaw['enabled'] !== 'boolean') p.push(ctx('admin.enabled must be boolean'));
@@ -607,6 +662,8 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
     else admin.host = admRaw['host'];
   }
   admin.port = optNum(admRaw, 'port', ctx('admin'), 3001, 0, p);
+  checkKnown(admRaw, ['enabled', 'host', 'port', 'allowPublicAdmin', 'allowedHosts'], ctx('admin'), false, p);
+  admin.allowedHosts = strArray(admRaw, 'allowedHosts', ctx('admin'), p);
   if (admRaw['allowPublicAdmin'] !== undefined) {
     if (typeof admRaw['allowPublicAdmin'] !== 'boolean') p.push(ctx('admin.allowPublicAdmin must be boolean'));
     else admin.allowPublicAdmin = admRaw['allowPublicAdmin'];
@@ -704,16 +761,30 @@ function isPublicBind(host: string): boolean {
   return host === '0.0.0.0' || host === '::';
 }
 
+/**
+ * File names to try for a bare command in one PATH directory. On Windows a
+ * command like `npx` is really `npx.cmd`, found through PATHEXT; without this
+ * `validate` warned about every npm-installed server on Windows.
+ */
+export function commandCandidates(command: string, platform: string = process.platform, pathExt: string = process.env['PATHEXT'] ?? '.COM;.EXE;.BAT;.CMD'): string[] {
+  if (platform !== 'win32') return [command];
+  const exts = pathExt.split(';').filter((e) => e.length > 0);
+  const hasExt = exts.some((e) => command.toLowerCase().endsWith(e.toLowerCase()));
+  return hasExt ? [command] : [command, ...exts.map((e) => command + e.toLowerCase()), ...exts.map((e) => command + e.toUpperCase())];
+}
+
 function commandResolvable(command: string): boolean {
   // bare binary: search PATH manually (no shell — never spawn one for this)
-  const pathEnv = process.env['PATH'] ?? '';
+  const pathEnv = process.env['PATH'] ?? process.env['Path'] ?? '';
   for (const dir of pathEnv.split(pathDelimiter)) {
     if (!dir) continue;
-    try {
-      accessSync(`${dir}/${command}`, constants.X_OK);
-      return true;
-    } catch {
-      /* next */
+    for (const name of commandCandidates(command)) {
+      try {
+        accessSync(joinPath(dir, name), constants.X_OK);
+        return true;
+      } catch {
+        /* next */
+      }
     }
   }
   return false;

@@ -7,6 +7,10 @@ interface Args {
     force: boolean;
     rest: string[];
     keyEnv?: string;
+    tool?: string;
+    toolArgs?: string;
+    keyId?: string;
+    generate: boolean;
 }
 declare function parseArgs(argv: string[]): Args;
 export { parseArgs };

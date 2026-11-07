@@ -13,7 +13,7 @@
  */
 import { createHash, createHmac } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { nowIso, safeJsonStringify, truncate } from './util.js';
+import { escapeHostileJson, nowIso, safeJsonStringify, truncate } from './util.js';
 import type { AuditConfig } from './config.js';
 
 export type AuditStatus = 'ok' | 'error' | 'denied' | 'rate_limited' | 'timeout' | 'blocked' | 'auth_failed';
@@ -78,7 +78,7 @@ export class AuditLogger {
       this.ensureOpen();
       let prepared = this.prepare(record);
       if (this.cfg.chain === true) prepared = this.chain(prepared);
-      const line = safeJsonStringify(prepared) + '\n';
+      const line = escapeHostileJson(safeJsonStringify(prepared)) + '\n';
       appendFileSync(this.cfg.path, line, { encoding: 'utf8' });
       // Commit chain state only after the write succeeded, so a transient disk
       // error cannot leave a phantom link that later reads as tampering.
@@ -147,8 +147,9 @@ export class AuditLogger {
 
   private prepare(record: AuditRecord): AuditRecord {
     const out: AuditRecord = { ...record, ts: record.ts || nowIso() };
+    if (this.cfg.redactValues !== false && typeof out.errorMessage === 'string') out.errorMessage = redactText(out.errorMessage);
     if (this.cfg.logArgs && record.args !== undefined) {
-      const redacted = redactDeep(record.args, this.cfg.redactKeys);
+      const redacted = redactDeep(record.args, this.cfg.redactKeys, this.cfg.redactValues !== false);
       const serialized = safeJsonStringify(redacted);
       const { text, truncated } = truncate(serialized, this.cfg.maxArgsChars);
       // Store the (possibly truncated) JSON string form: re-parsing truncated
@@ -185,8 +186,32 @@ export class AuditLogger {
   }
 }
 
+/**
+ * Well-known credential SHAPES, redacted from any string value regardless of
+ * the key it sits under (a token pasted into a "query" or "note" argument has
+ * no secret-looking key). Every pattern is linear (no nested quantifiers).
+ * A tripwire for common formats, not a DLP engine.
+ */
+const SECRET_SHAPES: RegExp[] = [
+  /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/gi,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
+  /\bsk-[A-Za-z0-9_-]{20,}/g,
+  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g,
+  /\bgh[pousr]_[A-Za-z0-9]{30,}/g,
+  /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
+  /-----BEGIN [A-Z ]{0,30}PRIVATE KEY-----/g,
+  /(?<=:\/\/)[^\s/:@]{1,64}:[^\s/@]{1,128}(?=@)/g,
+];
+
+/** Replace known credential shapes inside free text. */
+export function redactText(text: string): string {
+  let out = text;
+  for (const re of SECRET_SHAPES) out = out.replace(re, REDACTED);
+  return out;
+}
+
 /** Recursively redact values whose key contains a redact substring (case-insensitive). */
-export function redactDeep(value: unknown, redactKeys: string[]): unknown {
+export function redactDeep(value: unknown, redactKeys: string[], shapes = false): unknown {
   const lowered = redactKeys.map((k) => k.toLowerCase());
   const shouldRedact = (key: string): boolean => {
     const lk = key.toLowerCase();
@@ -194,6 +219,7 @@ export function redactDeep(value: unknown, redactKeys: string[]): unknown {
   };
   const walk = (v: unknown, depth: number): unknown => {
     if (depth > 50) return REDACTED; // pathological nesting guard
+    if (shapes && typeof v === 'string') return redactText(v);
     if (Array.isArray(v)) return v.map((item) => walk(item, depth + 1));
     if (v !== null && typeof v === 'object') {
       const out: Record<string, unknown> = {};

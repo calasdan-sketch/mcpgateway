@@ -56,13 +56,20 @@ const sha = (s: string): Buffer => createHash('sha256').update(s, 'utf8').digest
  * and scans every key, so neither the presented key's length nor the position
  * of the matching key leaks through timing.
  */
-export function matchKey<K extends { key: string }>(keys: K[], presented: string): K | null {
+export function matchKey<K extends { key: string; keyHash?: string; expiresAt?: number }>(keys: K[], presented: string, now: number = Date.now()): K | null {
   const p = sha(presented);
   let found: K | null = null;
   for (const k of keys) {
-    if (timingSafeEqual(p, sha(k.key)) && found === null) found = k;
+    const stored = k.keyHash !== undefined ? Buffer.from(k.keyHash.slice('sha256:'.length), 'hex') : sha(k.key);
+    // Expiry is checked after the comparison and never changes how long it takes.
+    if (timingSafeEqual(p, stored) && found === null && (k.expiresAt === undefined || now < k.expiresAt)) found = k;
   }
   return found;
+}
+
+/** The value to put in `keyHash:` for a key. */
+export function hashKey(key: string): string {
+  return 'sha256:' + sha(key).toString('hex');
 }
 
 /**
@@ -75,4 +82,15 @@ const HOSTILE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u20
 export function stripHostile(s: string): { text: string; changed: boolean } {
   const text = s.replace(HOSTILE, '\ufffd');
   return { text, changed: text !== s };
+}
+
+/**
+ * Escape (do not remove) terminal-control, bidi and zero-width characters in an
+ * already-serialized JSON line as \uXXXX. The line parses back to exactly the
+ * same data, but `cat`/`less` can no longer be spoofed by what is inside it.
+ */
+// eslint-disable-next-line no-control-regex
+const HOSTILE_IN_JSON = /[\u0080-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g;
+export function escapeHostileJson(line: string): string {
+  return line.replace(HOSTILE_IN_JSON, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
 }

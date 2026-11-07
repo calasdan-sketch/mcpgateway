@@ -122,6 +122,12 @@ export function buildNamespace(catalogs, cfg) {
             description: tool.description,
             inputSchema: tool.inputSchema,
         };
+        if (tool.annotations !== undefined)
+            entry.annotations = tool.annotations;
+        if (tool.outputSchema !== undefined)
+            entry.outputSchema = tool.outputSchema;
+        if (tool.title !== undefined)
+            entry.title = tool.title;
         tools.push(entry);
         byPublicName.set(publicName, entry);
     }

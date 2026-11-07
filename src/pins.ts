@@ -25,6 +25,10 @@ export interface PinInput {
   originalName: string;
   description?: string;
   inputSchema?: unknown;
+  /** covered since 0.3.1: a flipped readOnlyHint is as dangerous as a changed description */
+  annotations?: unknown;
+  outputSchema?: unknown;
+  title?: string;
 }
 
 export interface PinReport {
@@ -52,8 +56,23 @@ export function pinKey(server: string, originalName: string): string {
   return `${server}:${originalName}`;
 }
 
-export function definitionHash(t: PinInput): string {
+function hasExtras(t: PinInput): boolean {
+  return t.annotations !== undefined || t.outputSchema !== undefined || t.title !== undefined;
+}
+
+/** Hash over description + inputSchema only (the 0.3.0 definition, kept for pin-file upgrades). */
+export function legacyDefinitionHash(t: PinInput): string {
   return 'sha256:' + createHash('sha256').update(canonical({ d: t.description ?? '', s: t.inputSchema ?? null })).digest('hex');
+}
+
+/**
+ * Description + inputSchema + (when present) annotations, outputSchema, title.
+ * A tool without extras hashes exactly as in 0.3.0, so existing pin files stay valid.
+ */
+export function definitionHash(t: PinInput): string {
+  if (!hasExtras(t)) return legacyDefinitionHash(t);
+  const x = { a: t.annotations ?? null, o: t.outputSchema ?? null, t: t.title ?? null };
+  return 'sha256:' + createHash('sha256').update(canonical({ d: t.description ?? '', s: t.inputSchema ?? null, x })).digest('hex');
 }
 
 export class PinRegistry {
@@ -61,6 +80,8 @@ export class PinRegistry {
   /** keys currently in violation (hash differs from the pin) */
   private violations = new Map<string, string>();
   private latest = new Map<string, string>();
+  /** pin file written by 0.3.0 (hashes cover description + schema only) */
+  private legacyFile = false;
 
   constructor(private cfg: PinningConfig) {
     if (cfg.mode === 'off' || cfg.file === undefined) return;
@@ -75,6 +96,7 @@ export class PinRegistry {
     if (pins === null || typeof pins !== 'object' || Array.isArray(pins)) {
       throw new Error(`policy.pinning.file "${cfg.file}" has no "pins" object — refusing to start`);
     }
+    this.legacyFile = (parsed as { version?: unknown }).version === 1;
     for (const [k, v] of Object.entries(pins as Record<string, unknown>)) {
       if (typeof v !== 'string' || !v.startsWith('sha256:')) throw new Error(`policy.pinning.file "${cfg.file}": bad hash for "${k}"`);
       this.pins.set(k, v);
@@ -100,13 +122,21 @@ export class PinRegistry {
       if (pinned === undefined) {
         this.pins.set(key, h);
         report.added.push(key);
+      } else if (pinned !== h && this.legacyFile && hasExtras(t) && pinned === legacyDefinitionHash(t)) {
+        // One-time upgrade of a 0.3.0 pin file: description + schema still match,
+        // the annotations are simply new to the pin. Trusted on first sight, then
+        // the file is rewritten as version 2 and this path closes for good.
+        this.pins.set(key, h);
+        report.added.push(key);
       } else if (pinned !== h) {
         this.violations.set(key, h);
         report.changed.push(key);
       }
     }
     for (const k of this.pins.keys()) if (!seen.has(k)) report.missing.push(k);
-    if (report.added.length > 0) this.save();
+    // The upgrade window is exactly one evaluation; rewrite as version 2 and close it.
+    if (report.added.length > 0 || this.legacyFile) this.save();
+    this.legacyFile = false;
     return report;
   }
 
@@ -138,7 +168,7 @@ export class PinRegistry {
   private save(): void {
     if (this.cfg.file === undefined) return;
     const tmp = `${this.cfg.file}.tmp`;
-    const body = JSON.stringify({ version: 1, pins: Object.fromEntries([...this.pins].sort(([a], [b]) => (a < b ? -1 : 1))) }, null, 2);
+    const body = JSON.stringify({ version: 2, pins: Object.fromEntries([...this.pins].sort(([a], [b]) => (a < b ? -1 : 1))) }, null, 2);
     writeFileSync(tmp, body, { encoding: 'utf8', mode: 0o600 });
     renameSync(tmp, this.cfg.file);
   }

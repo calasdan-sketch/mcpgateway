@@ -11,6 +11,7 @@
  * matchers on the JSON-encoded arguments (deliberately not regex — ReDoS).
  * response rules scan the JSON-encoded result (bounded window).
  */
+import { posix } from 'node:path';
 import { globMatch, safeJsonStringify } from './util.js';
 import type { PolicyConfig } from './config.js';
 
@@ -53,22 +54,100 @@ export function checkToolCall(policy: PolicyConfig, publicToolName: string, args
   // Argument rules: find the most specific matching rule set (exact name beats glob).
   const rule = findArgRule(policy, publicToolName);
   if (rule !== undefined) {
-    const argsJson = safeJsonStringify(args);
+    const m = policy.argMatch ?? { ignoreCase: false, normalizePaths: false };
+    const hay = argHaystacks(args, m);
+    const has = (pat: string): boolean => {
+      const p = prepPattern(pat, m);
+      return p.length > 0 && hay.some((h) => h.includes(p));
+    };
     if (rule.deny !== undefined) {
       for (const pat of rule.deny) {
-        if (argsJson.includes(pat)) {
+        if (has(pat)) {
           return { decision: 'deny', reason: 'arg_deny', detail: `arguments matched deny pattern for "${publicToolName}"` };
         }
       }
     }
     if (rule.allow !== undefined && rule.allow.length > 0) {
-      const ok = rule.allow.some((pat) => argsJson.includes(pat));
+      const ok = rule.allow.some((pat) => has(pat));
       if (!ok) {
         return { decision: 'deny', reason: 'arg_allow_miss', detail: `arguments matched no allow pattern for "${publicToolName}"` };
       }
     }
   }
   return { decision: 'allow', reason: 'allow', detail: '' };
+}
+
+export interface ArgMatchOptions {
+  /** compare case-insensitively (deny "/etc/passwd" also stops "/ETC/Passwd"); also strips invisible characters and folds Unicode compatibility forms */
+  ignoreCase: boolean;
+  /** treat backslash as /, percent-decode (up to 3 layers), collapse "//", "/./" and "/../" before comparing; same invisible/Unicode folding as ignoreCase */
+  normalizePaths: boolean;
+}
+
+const MAX_LEAVES = 4096;
+const MAX_LEAF_CHARS = 1_000_000;
+
+// zero-width, soft-hyphen, bidi and word-joiner characters: invisible, and a free way to split a banned word
+const INVISIBLE = /[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g;
+
+function normalizeText(s: string, m: ArgMatchOptions): string {
+  let t = s;
+  if (m.ignoreCase || m.normalizePaths) {
+    // "hardened" comparison: invisible characters removed, compatibility forms folded
+    // (full-width "／etc／passwd" becomes "/etc/passwd")
+    t = t.replace(INVISIBLE, '').normalize('NFKC');
+  }
+  if (m.normalizePaths) {
+    // decode up to three layers (%252e%252e) while the text keeps changing
+    for (let i = 0; i < 3 && t.includes('%'); i++) {
+      let next: string;
+      try {
+        next = decodeURIComponent(t);
+      } catch {
+        break;
+      }
+      if (next === t) break;
+      t = next;
+    }
+    if (t.includes('\\') || t.includes('/')) t = posix.normalize(t.replace(/\\/g, '/'));
+  }
+  return m.ignoreCase ? t.toLowerCase() : t;
+}
+
+function prepPattern(pat: string, m: ArgMatchOptions): string {
+  // Same transform as the haystack, so a pattern and the text it should match always agree.
+  return normalizeText(pat, m);
+}
+
+/**
+ * Texts a substring rule is tested against: the JSON encoding (what 0.3.0 used)
+ * PLUS every string value and key as raw text. The JSON form escapes
+ * backslashes and quotes, so a Windows path like C:\secret never matched a
+ * pattern written as C:\secret. Bounded so hostile arguments cannot stall the gateway.
+ */
+function argHaystacks(args: unknown, m: ArgMatchOptions): string[] {
+  // The whole-JSON text only gets case folding: path rewriting would mangle it ("https://" -> "https:/").
+  const json = safeJsonStringify(args);
+  const out: string[] = [m.ignoreCase ? json.toLowerCase() : json];
+  let leaves = 0;
+  let chars = 0;
+  const walk = (v: unknown, depth: number): void => {
+    if (leaves >= MAX_LEAVES || chars >= MAX_LEAF_CHARS || depth > 40) return;
+    if (typeof v === 'string') {
+      leaves += 1;
+      chars += v.length;
+      out.push(normalizeText(v, m));
+    } else if (Array.isArray(v)) {
+      for (const x of v) walk(x, depth + 1);
+    } else if (v !== null && typeof v === 'object') {
+      for (const [k, x] of Object.entries(v)) {
+        walk(k, depth + 1);
+        walk(x, depth + 1);
+      }
+    }
+  };
+  walk(args, 0);
+  return out;
 }
 
 /**

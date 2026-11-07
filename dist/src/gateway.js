@@ -18,7 +18,9 @@ import { VERSION } from './version.js';
 import { PinRegistry, suspiciousDescription } from './pins.js';
 import { stripHostile } from './util.js';
 export async function startGateway(cfg, opts = {}) {
-    const log = opts.log ?? ((m) => console.error(m));
+    // Everything logged may contain server-controlled text (tool names, errors): neutralize terminal control and bidi characters.
+    const sink = opts.log ?? ((m) => console.error(m));
+    const log = (m) => sink(stripHostile(m).text.replace(/[\r\n]+/g, ' ⏎ '));
     const metrics = new Metrics();
     // Blueprint §5: audit write failures are counted in Prometheus, never
     // fatal to the request path.
@@ -50,6 +52,7 @@ export async function startGateway(cfg, opts = {}) {
             metrics.serverReconnects.inc({ server: srv.name });
             log(`[mcpgateway] server "${srv.name}" reconnected`);
         },
+        ...(opts.onChildStderr ? { onChildStderr: opts.onChildStderr } : {}),
     }, opts.transportOverrides?.get(sc.name)));
     // Connect sequentially: deterministic startup order, clearer errors.
     for (const s of servers) {
@@ -113,6 +116,7 @@ export async function startGateway(cfg, opts = {}) {
             auth: cfg.auth,
             audit,
             metrics,
+            bind: { host: cfg.admin.host, allowedHosts: cfg.admin.allowedHosts },
             getServers: () => servers,
             getNamespace: () => state.namespace,
             pins: {
@@ -174,7 +178,7 @@ export async function startGateway(cfg, opts = {}) {
  * in anything the model or an operator's terminal will read.
  */
 function hardenNamespace(ns, pins, metrics, audit, log) {
-    const report = pins.evaluate(ns.tools.map((t) => ({ server: t.server, originalName: t.originalName, description: t.description, inputSchema: t.inputSchema })));
+    const report = pins.evaluate(ns.tools.map((t) => ({ server: t.server, originalName: t.originalName, description: t.description, inputSchema: t.inputSchema, annotations: t.annotations, outputSchema: t.outputSchema, title: t.title })));
     for (const k of report.changed) {
         metrics.pinViolations.inc({});
         const quarantined = pins.mode === 'block';
@@ -202,7 +206,14 @@ function hardenNamespace(ns, pins, metrics, audit, log) {
         const d = t.description === undefined ? undefined : stripHostile(t.description);
         if (d?.changed)
             warnings.push(`tool "${t.publicName}" description contained control/bidi/zero-width characters (replaced)`);
-        tools.push({ ...t, description: d?.text ?? t.description, inputSchema: sanitizeSchema(t.inputSchema) });
+        const clean = { ...t, description: d?.text ?? t.description, inputSchema: sanitizeSchema(t.inputSchema) };
+        if (t.annotations !== undefined)
+            clean.annotations = sanitizeSchema(t.annotations);
+        if (t.outputSchema !== undefined)
+            clean.outputSchema = sanitizeSchema(t.outputSchema);
+        if (t.title !== undefined)
+            clean.title = stripHostile(t.title).text;
+        tools.push(clean);
     }
     return { ...ns, tools, byPublicName: new Map(tools.map((t) => [t.publicName, t])), warnings };
 }

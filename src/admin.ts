@@ -15,7 +15,9 @@ import type { Metrics } from './metrics.js';
 import type { DownstreamServer } from './downstream.js';
 import type { NamespaceResult } from './namespace.js';
 import type { AuthKey } from './config.js';
-import { matchKey } from './util.js';
+import { matchKey, newRequestId } from './util.js';
+import { checkHostOrigin } from './upstream.js';
+import { redactText } from './audit.js';
 import { VERSION } from './version.js';
 
 export interface AdminDeps {
@@ -26,6 +28,8 @@ export interface AdminDeps {
   getNamespace: () => NamespaceResult | null;
   reloadCatalogs: () => Promise<void>;
   pins?: { violations: () => string[]; accept: (key?: string) => string[] };
+  /** bind host and Host-header allowlist (DNS-rebinding defense) */
+  bind?: { host: string; allowedHosts: string[] };
 }
 
 function authenticate(req: IncomingMessage, auth: AdminDeps['auth']): { keyId: string; scopes: string[] } | null {
@@ -54,18 +58,47 @@ export function startAdmin(deps: AdminDeps, host: string, port: number): Promise
   });
 }
 
+function auditAdmin(deps: AdminDeps, who: string, action: string, detail: string): void {
+  deps.audit.log({
+    ts: new Date().toISOString(),
+    reqId: newRequestId(),
+    keyId: who,
+    tool: `admin:${action}`,
+    server: 'gateway',
+    originalTool: action,
+    durationMs: 0,
+    status: 'ok',
+    errorMessage: detail || undefined,
+  });
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse, deps: AdminDeps): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const path = url.pathname;
 
+  // A web page in the operator's browser must not be able to drive the admin API
+  // (DNS rebinding turns a hostile site into "localhost"): same check as the MCP endpoint.
+  const hostProblem = checkHostOrigin(
+    { host: deps.bind?.host ?? '127.0.0.1', allowedHosts: deps.bind?.allowedHosts ?? [], allowedOrigins: [] },
+    req.headers['host'],
+    typeof req.headers['origin'] === 'string' ? req.headers['origin'] : undefined,
+  );
+  if (hostProblem !== null) {
+    deps.metrics.authFailures.inc({ reason: 'bad_host' });
+    json(res, 403, { error: hostProblem });
+    return;
+  }
+
   if (req.method === 'GET' && path === '/healthz') {
+    // Open for load balancers. Error text from downstream servers is untrusted
+    // and can echo secrets, so it is only shown to a caller with a valid key.
+    const detailed = !deps.auth.disabled && authenticate(req, deps.auth) !== null;
     const servers = deps.getServers().map((s) => ({
       name: s.name,
       up: s.healthy,
       circuit: s.circuitState,
       inflight: s.inFlight,
-      lastPingOk: s.lastPingOk,
-      lastError: s.lastError,
+      ...(detailed ? { lastPingOk: s.lastPingOk, lastError: s.lastError === null ? null : redactText(s.lastError).slice(0, 300) } : {}),
     }));
     const degraded = servers.some((s) => !s.up) || deps.audit.errors > 0;
     json(res, degraded ? 503 : 200, {
@@ -79,6 +112,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: AdminDeps
 
   const authed = authenticate(req, deps.auth);
   if (authed === null) {
+    deps.metrics.authFailures.inc({ reason: 'bad_key' });
     json(res, 401, { error: 'missing or invalid bearer token' });
     return;
   }
@@ -135,6 +169,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: AdminDeps
       return;
     }
     await deps.reloadCatalogs();
+    auditAdmin(deps, authed.keyId, 'reload', '');
     json(res, 200, { ok: true });
     return;
   }
@@ -162,6 +197,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: AdminDeps
     }
     const tool = url.searchParams.get('tool') ?? undefined;
     const accepted = deps.pins?.accept(tool) ?? [];
+    auditAdmin(deps, authed.keyId, 'pins.accept', `accepted: ${accepted.join(', ') || 'none'}`);
     json(res, 200, { accepted });
     return;
   }

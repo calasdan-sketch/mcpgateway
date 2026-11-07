@@ -44,6 +44,11 @@ export interface PolicyConfig {
     responseBlock: string[];
     responseWarn: string[];
     scanWindowChars: number;
+    /** How argRules substrings are compared (defaults: exact, case-sensitive; both off) */
+    argMatch?: {
+        ignoreCase: boolean;
+        normalizePaths: boolean;
+    };
     /** Rug-pull defense: pin each tool's description+schema hash (trust on first use). */
     pinning?: PinningConfig;
 }
@@ -55,7 +60,16 @@ export interface PinningConfig {
 }
 export interface AuthKey {
     id: string;
+    /** plaintext key (empty when keyHash is used) */
     key: string;
+    /** "sha256:<64 hex>" digest of the key — the config then never holds the secret (see `mcpgateway hash-key`) */
+    keyHash?: string;
+    /** key stops working at this instant (ISO 8601); checked on every request */
+    expiresAt?: number;
+    /** only tools whose server-declared annotations say readOnlyHint: true are visible/callable; no hint = not read-only */
+    readOnly?: boolean;
+    /** restrict tools, resources and prompts to these servers (globs over server names) */
+    allowServers?: string[];
     scopes: string[];
     /** per-key tool visibility (globs over public names); deny wins. Omitted = everything policy allows. */
     allowTools?: string[];
@@ -78,6 +92,8 @@ export interface AuditConfig {
     keepFiles: number;
     /** tamper-evident hash chain over records (see `mcpgateway audit-verify`) */
     chain?: boolean;
+    /** redact well-known credential shapes (bearer tokens, JWTs, sk-/ghp_/AKIA/xox keys, PEM headers, URL passwords) inside any string value. Default true. */
+    redactValues?: boolean;
     /** optional HMAC secret for the chain; without it an attacker who can rewrite the file can recompute hashes */
     chainKey?: string;
 }
@@ -86,6 +102,8 @@ export interface AdminConfig {
     host: string;
     port: number;
     allowPublicAdmin: boolean;
+    /** accepted Host header names (DNS-rebinding defense). Loopback binds default to loopback names only. */
+    allowedHosts: string[];
 }
 export interface UpstreamConfig {
     stdio: {
@@ -130,6 +148,12 @@ export declare function loadConfigFile(path: string, opts?: LoadOptions): Gatewa
 export declare function validateConfig(raw: Raw, source: string, opts?: LoadOptions): GatewayConfig;
 /** Warnings collected during validation (unknown keys etc.). Non-fatal. */
 export declare function configWarnings(cfg: GatewayConfig): string[];
+/**
+ * File names to try for a bare command in one PATH directory. On Windows a
+ * command like `npx` is really `npx.cmd`, found through PATHEXT; without this
+ * `validate` warned about every npm-installed server on Windows.
+ */
+export declare function commandCandidates(command: string, platform?: string, pathExt?: string): string[];
 /** Does this public tool name match any allow/deny-style glob list? Exported for policy use. */
 export declare function matchesAny(patterns: string[], value: string): boolean;
 export { globMatch };
