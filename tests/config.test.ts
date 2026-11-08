@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { validateConfig, configWarnings, loadConfigFile, interpolateEnv, ConfigError, type Raw } from '../src/config.js';
 
 const base = (over: Record<string, unknown> = {}): Raw => ({
-  servers: [{ name: 'a', transport: 'stdio', command: 'true' }],
+  servers: [{ name: 'a', transport: 'stdio', command: 'node' }],
   auth: { disabled: true },
   ...over,
 });
@@ -42,7 +42,7 @@ test('loadConfigFile interpolates env before validating', () => {
   process.env['MCPGW_TEST_TOKEN'] = 'tok-123';
   const dir = mkdtempSync(join(tmpdir(), 'mcpgw-cfg-'));
   const path = join(dir, 'gw.yaml');
-  writeFileSync(path, 'servers:\n  - name: a\n    transport: stdio\n    command: "true"\n    env:\n      T: "${MCPGW_TEST_TOKEN}"\nauth:\n  disabled: true\n', 'utf8');
+  writeFileSync(path, 'servers:\n  - name: a\n    transport: stdio\n    command: "node"\n    env:\n      T: "${MCPGW_TEST_TOKEN}"\nauth:\n  disabled: true\n', 'utf8');
   const cfg = loadConfigFile(path);
   assert.equal(cfg.servers[0]?.env?.['T'], 'tok-123');
   delete process.env['MCPGW_TEST_TOKEN'];
@@ -58,13 +58,13 @@ test('unset variable without default names the variable', () => {
 
 test('duplicate server names rejected', () => {
   assert.throws(
-    () => validateConfig(base({ servers: [{ name: 'a', transport: 'stdio', command: 'true' }, { name: 'a', transport: 'stdio', command: 'true' }] }), 'test'),
+    () => validateConfig(base({ servers: [{ name: 'a', transport: 'stdio', command: 'node' }, { name: 'a', transport: 'stdio', command: 'node' }] }), 'test'),
     (e: unknown) => e instanceof ConfigError && /duplicate server name/.test(e.message),
   );
 });
 
 test('server names must be lowercase slug', () => {
-  assert.throws(() => validateConfig(base({ servers: [{ name: 'Bad Name', transport: 'stdio', command: 'true' }] }), 'test'), ConfigError);
+  assert.throws(() => validateConfig(base({ servers: [{ name: 'Bad Name', transport: 'stdio', command: 'node' }] }), 'test'), ConfigError);
 });
 
 test('bad namespace strategy rejected', () => {

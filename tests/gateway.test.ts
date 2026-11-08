@@ -92,8 +92,8 @@ async function startHarness(rawOver: Record<string, unknown> = {}, extraTools: {
   const auditPath = join(mkdtempSync(join(tmpdir(), 'mcpgw-it-')), 'audit.jsonl');
   const cfg = validateConfig({
     servers: [
-      { name: 'alpha', transport: 'stdio', command: 'true' },
-      { name: 'beta', transport: 'stdio', command: 'true' },
+      { name: 'alpha', transport: 'stdio', command: 'node' },
+      { name: 'beta', transport: 'stdio', command: 'node' },
     ],
     auth: { disabled: true },
     audit: { path: auditPath },
@@ -316,7 +316,7 @@ test('downstream failure surfaces as a gateway error and is audited', async () =
   const [ct, st] = InMemoryTransport.createLinkedPair();
   await bad.server.connect(st);
   const cfg = validateConfig({
-    servers: [{ name: 'bad', transport: 'stdio', command: 'true', timeoutMs: 5000 }],
+    servers: [{ name: 'bad', transport: 'stdio', command: 'node', timeoutMs: 5000 }],
     auth: { disabled: true },
   } as Raw, 'test');
   const ds = new DownstreamServer(cfg.servers[0]!, { onCatalogChanged: () => undefined }, ct);
@@ -336,7 +336,7 @@ test('circuit breaker opens after threshold and fails fast', async () => {
   const [ct, st] = InMemoryTransport.createLinkedPair();
   await bad.server.connect(st);
   const cfg = validateConfig({
-    servers: [{ name: 'bad', transport: 'stdio', command: 'true', failureThreshold: 2, breakerCooldownMs: 60000, timeoutMs: 5000 }],
+    servers: [{ name: 'bad', transport: 'stdio', command: 'node', failureThreshold: 2, breakerCooldownMs: 60000, timeoutMs: 5000 }],
     auth: { disabled: true },
   } as Raw, 'test');
   const ds = new DownstreamServer(cfg.servers[0]!, { onCatalogChanged: () => undefined }, ct);
@@ -416,7 +416,7 @@ test('http sessions are capped (429 past maxSessions)', async () => {
   await fakeA.server.connect(st);
   const auditPath = join(mkdtempSync(join(tmpdir(), 'mcpgw-it-')), 'audit.jsonl');
   const cfg = validateConfig({
-    servers: [{ name: 'a', transport: 'stdio', command: 'true' }],
+    servers: [{ name: 'a', transport: 'stdio', command: 'node' }],
     auth: { disabled: true },
     audit: { path: auditPath },
     admin: { enabled: false },
@@ -441,6 +441,58 @@ test('http sessions are capped (429 past maxSessions)', async () => {
     const r2 = await initReq();
     assert.equal(r2.status, 429);
     await r2.body?.cancel();
+  } finally {
+    await gw.close();
+    await fakeA.server.close().catch(() => undefined);
+  }
+});
+
+test('http session ids are bound to the key that created them', async () => {
+  const fakeA = makeFake('a-srv', { ping: () => textResult('p') });
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  await fakeA.server.connect(st);
+  const auditPath = join(mkdtempSync(join(tmpdir(), 'mcpgw-it-')), 'audit.jsonl');
+  const keyA = 'a'.repeat(32);
+  const keyB = 'b'.repeat(32);
+  const cfg = validateConfig({
+    servers: [{ name: 'a', transport: 'stdio', command: 'node' }],
+    auth: { keys: [{ id: 'ka', key: keyA, scopes: ['tools:call', 'tools:list'] }, { id: 'kb', key: keyB, scopes: ['tools:call', 'tools:list'] }] },
+    audit: { path: auditPath },
+    admin: { enabled: false },
+    upstream: { stdio: { enabled: false }, http: { enabled: true, host: '127.0.0.1', port: 0 } },
+  } as Raw, 'test');
+  const gw = await startGateway(cfg, { transportOverrides: new Map([['a', ct]]), noAdmin: true, log: () => undefined });
+  try {
+    const port = (gw.httpServer?.address() as import('node:net').AddressInfo).port;
+    const post = (key: string, body: unknown, sessionId?: string) =>
+      fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          authorization: `Bearer ${key}`,
+          ...(sessionId !== undefined ? { 'mcp-session-id': sessionId } : {}),
+        },
+        body: JSON.stringify(body),
+      });
+    const init = await post(keyA, {
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } },
+    });
+    assert.equal(init.status, 200);
+    const sid = init.headers.get('mcp-session-id');
+    assert.ok(sid);
+    await init.body?.cancel();
+    // A different valid key must not be able to ride key A's session.
+    const hijack = await post(keyB, { jsonrpc: '2.0', id: 2, method: 'tools/list' }, sid);
+    assert.equal(hijack.status, 400);
+    await hijack.body?.cancel();
+    const hijackGet = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${keyB}`, 'mcp-session-id': sid },
+    });
+    assert.equal(hijackGet.status, 400);
+    await hijackGet.body?.cancel();
   } finally {
     await gw.close();
     await fakeA.server.close().catch(() => undefined);

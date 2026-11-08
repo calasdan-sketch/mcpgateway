@@ -6,7 +6,7 @@
  * still sanity-checks commands exist and warns on cleartext remote URLs.
  */
 import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
-import { delimiter as pathDelimiter } from 'node:path';
+import { delimiter as pathDelimiter, isAbsolute } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { globMatch } from './util.js';
 
@@ -297,7 +297,8 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
           cfg.command = command;
           if (!opts.noNetwork) {
             // command may be a bare binary resolved via PATH; check resolvability
-            const resolved = command.includes('/') ? existsSync(command) : commandResolvable(command);
+            const isPath = command.includes('/') || command.includes('\\') || isAbsolute(command);
+            const resolved = isPath ? existsSync(command) : commandResolvable(command);
             if (!resolved) p.push(`${sc}: command "${command}" not found (not on PATH and not an existing path)`);
           }
         }
@@ -616,13 +617,17 @@ function isPublicBind(host: string): boolean {
 function commandResolvable(command: string): boolean {
   // bare binary: search PATH manually (no shell — never spawn one for this)
   const pathEnv = process.env['PATH'] ?? '';
+  // Windows: spawn() finds `node` as node.exe via PATHEXT, so check those too.
+  const exts = process.platform === 'win32' ? ['', ...(process.env['PATHEXT'] ?? '.COM;.EXE;.BAT;.CMD').split(';')] : [''];
   for (const dir of pathEnv.split(pathDelimiter)) {
     if (!dir) continue;
-    try {
-      accessSync(`${dir}/${command}`, constants.X_OK);
-      return true;
-    } catch {
-      /* next */
+    for (const ext of exts) {
+      try {
+        accessSync(`${dir}/${command}${ext}`, constants.X_OK);
+        return true;
+      } catch {
+        /* next */
+      }
     }
   }
   return false;

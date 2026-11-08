@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AuditLogger, collectSecretValues, redactDeep, redactSecretValues } from '../src/audit.js';
@@ -100,7 +100,11 @@ test('rotation bounds disk usage', () => {
 });
 
 test('unwritable path never throws; errors are counted', () => {
-  const log = new AuditLogger(baseAudit({ path: '/nonexistent-dir-xyz/audit.jsonl' }));
+  // A regular file used as a directory is unwritable on every OS (an absolute
+  // '/nonexistent-dir' path can actually exist on a dev box).
+  const notADir = join(mkdtempSync(join(tmpdir(), 'mcpgw-audit-')), 'file');
+  writeFileSync(notADir, '');
+  const log = new AuditLogger(baseAudit({ path: join(notADir, 'audit.jsonl') }));
   assert.doesNotThrow(() => log.log(baseRecord()));
   assert.ok(log.errors > 0);
 });
