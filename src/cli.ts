@@ -40,7 +40,7 @@ Options:
   -o, --output <path>   init: output path (default: ./mcpgateway.yaml)
   -f, --force           init: overwrite existing file
 
-Docs: https://github.com/calasdan-sketch/mcpgateway (when published)
+Maintained by Calas Automations Inc. Docs: the README shipped in this package.
 `;
 
 interface Args {
@@ -58,20 +58,29 @@ interface Args {
   generate: boolean;
 }
 
+/** Value of a flag like `-c <path>`; a missing value (or another flag in its place) is a usage error. */
+function takeValue(argv: string[], i: number, flag: string): string {
+  const v = argv[i];
+  if (v === undefined || (v.startsWith('-') && v !== '-' && !(flag === '--args'))) {
+    throw new Error(`flag "${flag}" needs a value (see --help)`);
+  }
+  return v;
+}
+
 function parseArgs(argv: string[]): Args {
   const args: Args = { command: '', config: './mcpgateway.yaml', network: false, http: false, output: './mcpgateway.yaml', force: false, rest: [], generate: false };
   const rest: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] as string;
-    if (a === '-c' || a === '--config') args.config = argv[++i] as string;
+    if (a === '-c' || a === '--config') args.config = takeValue(argv, ++i, a);
     else if (a === '--network') args.network = true;
     else if (a === '--http') args.http = true;
-    else if (a === '-o' || a === '--output') args.output = argv[++i] as string;
+    else if (a === '-o' || a === '--output') args.output = takeValue(argv, ++i, a);
     else if (a === '-f' || a === '--force') args.force = true;
-    else if (a === '--key-env') args.keyEnv = argv[++i] as string;
-    else if (a === '--tool') args.tool = argv[++i] as string;
-    else if (a === '--args') args.toolArgs = argv[++i] as string;
-    else if (a === '--key') args.keyId = argv[++i] as string;
+    else if (a === '--key-env') args.keyEnv = takeValue(argv, ++i, a);
+    else if (a === '--tool') args.tool = takeValue(argv, ++i, a);
+    else if (a === '--args') args.toolArgs = takeValue(argv, ++i, a);
+    else if (a === '--key') args.keyId = takeValue(argv, ++i, a);
     else if (a === '--generate') args.generate = true;
     else if (a === '--version' || a === '-V') return { ...args, command: 'version' };
     else if (a === '--help' || a === '-h') return { ...args, command: 'help' };
@@ -161,7 +170,10 @@ async function cmdServe(args: Args): Promise<void> {
     console.error(`[mcpgateway] serving ${gateway.getNamespace()?.tools.length ?? 0} unified tools on stdio`);
   }
 
+  let stopping = false;
   const shutdown = () => {
+    if (stopping) return;
+    stopping = true;
     console.error('[mcpgateway] shutting down…');
     void gateway.close().then(() => process.exit(0));
     // Hard stop if graceful close hangs (a wedged child must not pin us).
@@ -169,6 +181,15 @@ async function cmdServe(args: Args): Promise<void> {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  // stdio mode: the client closing our stdin means it is gone (or is asking us to stop,
+  // per the MCP stdio shutdown sequence). Without this the gateway, its admin port and
+  // every child server outlived a client that was killed or crashed.
+  // Only when stdio is the sole upstream: with HTTP enabled too, a supervisor that gives the
+  // process no stdin (systemd, docker without -i) is a normal deployment and must keep running.
+  if (cfg.upstream.stdio.enabled && !cfg.upstream.http.enabled) {
+    process.stdin.on('end', shutdown);
+    process.stdin.on('close', shutdown);
+  }
   // Keep the event loop alive for stdio mode (the transport holds it anyway;
   // this is belt-and-braces for http-only mode without admin).
   await new Promise(() => undefined);
@@ -265,7 +286,8 @@ function cmdPolicyTest(args: Args): void {
       return;
     }
   }
-  const cfg = loadConfigOrExit(args.config, true);
+  // exit 2 for a bad config: 1 already means "DENY" here, and CI must tell the two apart
+  const cfg = loadConfigOrExit(args.config, true, 2);
   const tool = args.tool;
   const notes: string[] = [];
   if (isHidden(cfg.policy, tool)) {
@@ -343,12 +365,12 @@ function cmdInit(args: Args): void {
   console.log(`wrote ${args.output} — edit it, then run: mcpgateway validate -c ${args.output}`);
 }
 
-function loadConfigOrExit(path: string, noNetwork: boolean) {
+function loadConfigOrExit(path: string, noNetwork: boolean, failCode = 1) {
   try {
     return loadConfigFile(path, { noNetwork });
   } catch (e) {
     reportConfigError(e);
-    process.exit(1);
+    process.exit(failCode);
     throw new Error('unreachable');
   }
 }

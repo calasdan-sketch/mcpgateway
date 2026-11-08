@@ -349,7 +349,7 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
           cfg.command = command;
           if (!opts.noNetwork) {
             // command may be a bare binary resolved via PATH; check resolvability
-            const resolved = command.includes('/') ? existsSync(command) : commandResolvable(command);
+            const resolved = hasPathSeparator(command) ? commandCandidates(command).some((c) => existsSync(c)) : commandResolvable(command);
             if (!resolved) p.push(`${sc}: command "${command}" not found (not on PATH and not an existing path)`);
           }
         }
@@ -772,6 +772,11 @@ export function commandCandidates(command: string, platform: string = process.pl
   const exts = pathExt.split(';').filter((e) => e.length > 0);
   const hasExt = exts.some((e) => command.toLowerCase().endsWith(e.toLowerCase()));
   return hasExt ? [command] : [command, ...exts.map((e) => command + e.toLowerCase()), ...exts.map((e) => command + e.toUpperCase())];
+}
+
+/** Is this command a path (contains a directory separator) rather than a bare name looked up on PATH? Windows also uses a backslash. */
+export function hasPathSeparator(command: string, platform: string = process.platform): boolean {
+  return platform === 'win32' ? /[\\/]/.test(command) : command.includes('/');
 }
 
 function commandResolvable(command: string): boolean {

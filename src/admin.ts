@@ -15,7 +15,7 @@ import type { Metrics } from './metrics.js';
 import type { DownstreamServer } from './downstream.js';
 import type { NamespaceResult } from './namespace.js';
 import type { AuthKey } from './config.js';
-import { matchKey, newRequestId } from './util.js';
+import { bearerToken, matchKey, newRequestId } from './util.js';
 import { checkHostOrigin } from './upstream.js';
 import { redactText } from './audit.js';
 import { VERSION } from './version.js';
@@ -34,9 +34,8 @@ export interface AdminDeps {
 
 function authenticate(req: IncomingMessage, auth: AdminDeps['auth']): { keyId: string; scopes: string[] } | null {
   if (auth.disabled) return { keyId: 'anonymous', scopes: ['admin'] };
-  const header = req.headers['authorization'];
-  if (typeof header !== 'string' || !header.startsWith('Bearer ')) return null;
-  const presented = header.slice('Bearer '.length);
+  const presented = bearerToken(req.headers['authorization']);
+  if (presented === null) return null;
   const k = matchKey(auth.keys, presented);
   return k === null ? null : { keyId: k.id, scopes: k.scopes };
 }
@@ -52,6 +51,8 @@ export function startAdmin(deps: AdminDeps, host: string, port: number): Promise
       if (!res.headersSent) json(res, 500, { error: 'internal error' });
     });
   });
+  server.headersTimeout = 15_000;
+  server.requestTimeout = 60_000;
   return new Promise((resolve, reject) => {
     server.on('error', reject);
     server.listen(port, host, () => resolve(server));

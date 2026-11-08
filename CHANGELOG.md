@@ -4,6 +4,37 @@
 
 Expert review round (MCP platform, proxy performance, security, enterprise admin, agent developer).
 
+### Round 5 (additions to this unreleased line)
+
+Specialists: MCP server/protocol author, API gateway / authorization engineer, application-security
+reviewer, site-reliability engineer (see `docs/ROUND5.md`).
+
+#### Fixed
+- **One key could open the circuit breaker for everyone.** A tool call whose arguments nested tens of
+  thousands of levels deep overflowed the stack inside the call path; the failure counted as a downstream
+  error, so a dozen such calls from any valid key (even a read-only one) made every call to that server
+  fail with "circuit breaker is open". Arguments nested deeper than 100 levels are now refused up front
+  (-32602, audited as `denied` / `args_too_deep`, never forwarded, never counted against the breaker).
+- **Unknown or closed Streamable HTTP sessions answered 400.** The MCP session rules say 404, which is
+  what tells a client to start a new session. Now 404 on POST, GET and DELETE.
+- **`Authorization: bearer <key>` (lower case) was rejected.** The scheme name is case-insensitive
+  (RFC 7235); accepted on the MCP and admin endpoints.
+- **stdio-only mode kept running after the client closed stdin**, holding the admin port and every child
+  server. It now shuts down (exit 0) like it does on SIGTERM; a second signal is ignored while stopping.
+  With the HTTP upstream also enabled it keeps running (a supervisor with no stdin is normal there).
+- **`-c` (or `--tool`, `-o`, `--key`, ...) with no value** produced "cannot read config file undefined".
+  Now a plain usage error, exit 2.
+- **`policy-test` with a broken config exited 1**, the same code as DENY. It exits 2 now.
+- **Windows:** a server command written as a path with backslashes (`C:\tools\srv.exe`) was treated as a bare
+  name and searched on PATH. (Static fix and unit test only; never run on Windows.)
+
+#### Changed
+- Request headers must arrive within 15 s and the full request within 60 s (slow-client defense).
+- Package metadata: `author` is `Calas Automations Inc.`; the published file list is limited to `dist/src`,
+  the example config, README, LICENSE and CHANGELOG (no tests, source maps or test fixtures); keywords added.
+  `node_modules/` and `dist/` are no longer tracked in git. No repository URL is claimed (the repo is private).
+- `--help` ends with "Maintained by Calas Automations Inc." instead of a GitHub URL.
+
 ### Round 3 (additions to this unreleased line)
 
 Specialists: MCP protocol engineer, red-team attacker, compliance auditor, production SRE,

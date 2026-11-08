@@ -38,13 +38,17 @@ the server command) or Streamable HTTP.
 
 ## Install
 
+`mcpgateway` is **not on the npm registry yet** (a registry lookup for the name returned
+"not found" on 2026-11-08). Until it is published, install from a checkout:
+
 ```bash
-npm install -g mcpgateway
-# or run from source:
-npm install && npm run build && node dist/src/index.js --help
+npm install && npm run build
+npm pack                       # writes mcpgateway-<version>.tgz
+npm install -g ./mcpgateway-*.tgz
+mcpgateway --version
 ```
 
-Requires Node ≥ 20.
+Requires Node ≥ 20. Maintained by Calas Automations Inc.
 
 ## Quickstart
 
@@ -95,7 +99,7 @@ not mention it, not that it is absent. Corrections welcome.
 | Web UI | **no** | yes | yes | Docker Desktop | yes | - |
 | Clustering / HA | **no** | yes | - | - | - | yes (K8s) |
 
-Re-read for this release (README text only, none of them installed or run): ContextForge
+Re-read on 2026-11-08 (their README text fetched read-only, none installed or run): ContextForge
 advertises OpenTelemetry tracing, 40+ plugins and retry policies; Docker's gateway
 advertises Docker Desktop secrets management. mcpgateway has none of those.
 
@@ -131,6 +135,12 @@ New in this release, same VM:
 | exact (default) | 1.9 to 2.6 us | 240 to 470 us |
 | `ignoreCase` | 3.1 to 5.8 us | 450 to 710 us |
 | `ignoreCase` + `normalizePaths` | 3.7 to 6.4 us | 680 to 1070 us |
+
+Re-run on 2026-11-08 (round 5) on a busier VM, so everything is 2x to 4x slower than the runs above;
+compare ratios only: direct p50 225 us, gateway 497 us (+272 us), gateway with the audit chain 573 us;
+`argRules` exact 10 us (100 B) and 1.4 ms (100 KB); audit 17k to 27k records/s. New in round 5, the
+argument depth guard: 0.1 us for ~100 B args and 53 us for ~100 KB args of mostly text (about 0.7 ms
+for 128 KB made of 8,000 small objects, its worst shape). `npm run bench` prints it as section 6.
 
 Credential-shape redaction (`audit.redactValues`) on 600-char string arguments: about
 66k to 105k records/s off, 46k to 89k on. `bench/run.mjs` prints all of these.
@@ -325,7 +335,7 @@ mcpgateway validate [-c config.yaml]  # config checks; --network adds reachabili
 mcpgateway namespace [-c config.yaml] # connect + print the unified tool table
 mcpgateway init [-o out.yaml]         # write the starter config
 mcpgateway policy-test --tool NAME [--args JSON] [--key ID] [-c config.yaml]
-                                      # what would policy do with this call? (offline; exit 1 = deny)
+                                      # what would policy do with this call? (offline; exit 0 = allow, 1 = deny, 2 = bad config or usage)
 mcpgateway hash-key [--generate | --key-env VAR]   # keyHash for the config (key from stdin by default)
 mcpgateway audit-verify <audit.jsonl> [--key-env VAR]
 ```
@@ -358,7 +368,7 @@ mcpgateway audit-verify <audit.jsonl> [--key-env VAR]
 - **Host/Origin checks need configuration off loopback.** Loopback binds reject
   foreign `Host` and `Origin` headers by default (DNS-rebinding defense). A public
   bind is unchecked until you set `upstream.http.allowedHosts`/`allowedOrigins`.
-  The admin API (`/healthz` is open) does not do this check yet.
+  The admin API (`/healthz` is open) checks `Host`/`Origin` the same way.
 - **Progress and logging notifications are not forwarded.** Client cancellation is (the
   downstream call is aborted and does not count against the circuit breaker), but a
   `progressToken` is not passed through and `notifications/message` from servers is dropped.
@@ -366,7 +376,13 @@ mcpgateway audit-verify <audit.jsonl> [--key-env VAR]
   not a server that lied from the first day.
 - **Catalogs are capped** at 200 pages / 20,000 entries per kind and server (a server that
   loops its cursor cannot trap the gateway). A failed refresh keeps the previous catalog.
-- **JSON-RPC batches are capped at 100 messages** (413 above that).
+- **JSON-RPC batches are capped at 100 messages** (413 above that). Tool-call arguments may nest
+  at most 100 levels (refused with -32602 and audited as `args_too_deep`, never forwarded).
+- **Slow clients are cut off:** request headers must arrive within 15 s and the whole request within 60 s.
+- **stdio-only mode ends when the client closes stdin** (exit 0, children stopped); `SIGTERM`/`SIGINT` do the same
+  in every mode. With the HTTP upstream also on, closing stdin does not stop the gateway.
+- **Malformed JSON-RPC shapes** (for example `tools/call` without a `name`) get the MCP SDK's own
+  validation error, which is a -32603 carrying the validator's text, not a tidy -32602. Not changed here.
 - **A crashed server's in-flight call fails** (it is not retried); the server
   itself is reconnected with backoff (1s doubling to 30s).
 - **No SSE resumability.** No event store: if a Streamable HTTP connection
@@ -374,9 +390,9 @@ mcpgateway audit-verify <audit.jsonl> [--key-env VAR]
   (`maxSessions`, default 128) so abandoned ones can't exhaust memory.
 - **Wedged stdio children** get SIGTERM, then SIGKILL after 2 s. Not tested on Windows,
   where signals behave differently.
-- **Windows is untested.** Path handling, `PATHEXT` lookup for `validate` and the
-  `normalizePaths` rule are covered by unit tests of the logic only; no Windows machine
-  was available.
+- **Windows is untested.** Path handling, `PATHEXT` lookup for `validate`, backslash
+  commands and the `normalizePaths` rule are covered by unit tests of the logic only; no
+  Windows machine was available. The pin file's `0600` mode has no effect on Windows.
 - **Downstream error messages are scrubbed** of any secret values seen in the
   call's args (same redact-key list as the audit log), then truncated — but a
   server that leaks secrets through *other* channels (e.g. inside a returned
@@ -386,7 +402,7 @@ mcpgateway audit-verify <audit.jsonl> [--key-env VAR]
 
 ```bash
 npm install
-npm test        # build + 153 tests (unit, in-process integration, real stdio crash recovery, HTTP)
+npm test        # build + 168 tests (unit, in-process integration, real stdio crash recovery, HTTP)
 npm run bench   # tools/list size, per-call latency, audit throughput
 npm run lint    # tsc --noEmit (strict)
 ```

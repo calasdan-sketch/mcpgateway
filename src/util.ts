@@ -94,3 +94,49 @@ const HOSTILE_IN_JSON = /[\u0080-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2
 export function escapeHostileJson(line: string): string {
   return line.replace(HOSTILE_IN_JSON, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
 }
+
+/** Deepest nesting a tool-call argument may have. Real arguments are a few levels deep. */
+export const MAX_ARG_DEPTH = 100;
+
+/**
+ * True when `value` nests objects/arrays deeper than `max`. Iterative on purpose:
+ * a recursive walk is exactly what a 60,000-deep payload would crash.
+ */
+export function exceedsDepth(value: unknown, max: number = MAX_ARG_DEPTH): boolean {
+  if (value === null || typeof value !== 'object') return false;
+  const nodes: object[] = [value as object];
+  const depths: number[] = [1];
+  while (nodes.length > 0) {
+    const node = nodes.pop() as object;
+    const depth = depths.pop() as number;
+    if (depth > max) return true;
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length; i++) {
+        const c: unknown = node[i];
+        if (typeof c === 'object' && c !== null) {
+          nodes.push(c);
+          depths.push(depth + 1);
+        }
+      }
+    } else {
+      for (const k in node) {
+        const c: unknown = (node as Record<string, unknown>)[k];
+        if (typeof c === 'object' && c !== null) {
+          nodes.push(c);
+          depths.push(depth + 1);
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Token of an `Authorization: Bearer <token>` header, or null. The scheme name is
+ * case-insensitive (RFC 7235 section 2.1), so `bearer` and `BEARER` are accepted.
+ */
+export function bearerToken(header: unknown): string | null {
+  if (typeof header !== 'string') return null;
+  const m = /^bearer +(.*)$/is.exec(header);
+  return m === null ? null : (m[1] as string);
+}

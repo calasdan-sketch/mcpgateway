@@ -11,6 +11,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { validateConfig } from '../dist/src/config.js';
 import { startGateway } from '../dist/src/gateway.js';
 import { AuditLogger, redactText } from '../dist/src/audit.js';
+import { exceedsDepth } from '../dist/src/util.js';
 import { checkToolCall } from '../dist/src/policy.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -111,6 +112,12 @@ for (const redactValues of [false, true]) {
   const st = process.hrtime.bigint();
   for (let i = 0; i < 20000; i++) log.log({ ts: new Date().toISOString(), reqId: String(i), tool: 't', server: 's', originalTool: 't', durationMs: 1, status: 'ok', args: { note } });
   console.log(`redactValues=${redactValues}: ${(20000 / (Number(process.hrtime.bigint() - st) / 1e9)).toFixed(0)} records/s`);
+}
+
+console.log('\n## 6. argument depth guard (exceedsDepth, microseconds per call)');
+{
+  const run = (a, n) => { const st = process.hrtime.bigint(); for (let i = 0; i < n; i++) exceedsDepth(a); return Number(process.hrtime.bigint() - st) / 1e3 / n; };
+  console.log(`~100 B args: ${run(argsSmall, 200000).toFixed(2)} us; ~100 KB args: ${run(argsLarge, 500).toFixed(0)} us`);
 }
 
 rmSync(dir, { recursive: true, force: true });

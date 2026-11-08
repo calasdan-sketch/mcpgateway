@@ -42,7 +42,7 @@ import { collectSecretValues, redactSecretValues, redactText } from './audit.js'
 import type { Metrics } from './metrics.js';
 import type { RateLimiter } from './ratelimit.js';
 import { checkResponse, checkToolCall, isHidden } from './policy.js';
-import { globMatch, matchKey, newRequestId, safeJsonStringify, stripHostile, truncate } from './util.js';
+import { MAX_ARG_DEPTH, bearerToken, exceedsDepth, globMatch, matchKey, newRequestId, safeJsonStringify, stripHostile, truncate } from './util.js';
 import { VERSION } from './version.js';
 import type { AuthKey, ExposureConfig, PolicyConfig, RateLimitRule } from './config.js';
 
@@ -301,6 +301,10 @@ export class GatewayUpstream {
         void e;
       });
     });
+    // Slow-client defense: a MCP request is small, so headers and body get a short deadline
+    // (responses, including long-lived SSE streams, are not affected).
+    httpServer.headersTimeout = 15_000;
+    httpServer.requestTimeout = 60_000;
     return new Promise((resolve, reject) => {
       httpServer.on('error', reject);
       httpServer.listen(port, host, () => resolve(httpServer));
@@ -379,8 +383,8 @@ export class GatewayUpstream {
       let transport: StreamableHTTPServerTransport | undefined = existing?.transport;
       if (transport === undefined) {
         if (sessionId !== undefined) {
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'unknown mcp-session-id' }));
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'unknown mcp-session-id (start a new session with initialize)' }));
           return;
         }
         // Bound the session table: clients that never DELETE would otherwise
@@ -418,8 +422,8 @@ export class GatewayUpstream {
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
       const entry = sessionId !== undefined ? sessions.get(sessionId) : undefined;
       if (entry === undefined) {
-        res.writeHead(400, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'unknown mcp-session-id' }));
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unknown mcp-session-id (start a new session with initialize)' }));
         return;
       }
       if (entry.keyId !== authed.keyId) {
@@ -564,9 +568,8 @@ export class GatewayUpstream {
   /** Bearer auth for the HTTP upstream. Returns null when rejected. */
   authenticateHttp(req: IncomingMessage): AuthedKey | null {
     if (this.deps.auth.disabled) return { keyId: 'anonymous', scopes: [...VALID_UPSTREAM_SCOPES] };
-    const header = req.headers['authorization'];
-    if (typeof header !== 'string' || !header.startsWith('Bearer ')) return null;
-    const presented = header.slice('Bearer '.length);
+    const presented = bearerToken(req.headers['authorization']);
+    if (presented === null) return null;
     const k = matchKey(this.deps.auth.keys, presented);
     return k === null ? null : { keyId: k.id, scopes: k.scopes };
   }
@@ -640,6 +643,15 @@ export class GatewayUpstream {
       metrics.policyDenials.inc({ tool: publicName, reason: 'key_acl' });
       finish('denied', { policyReason: 'key_acl', errorMessage: `tool "${publicName}" is not permitted for key "${ctx.keyId ?? ''}"` });
       throw new McpError(ErrorCode.InvalidParams, `unknown tool "${truncateName(publicName)}"`);
+    }
+
+    // 2c. Absurdly nested arguments are refused up front, never forwarded and never counted
+    // against the downstream server's circuit breaker (one key must not be able to open it
+    // for everyone). Fails closed in observe mode too: the policy cannot judge what it cannot walk.
+    if (exceedsDepth(args)) {
+      metrics.policyDenials.inc({ tool: publicName, reason: 'args_too_deep' });
+      finish('denied', { policyReason: 'args_too_deep', errorMessage: `arguments nest deeper than ${MAX_ARG_DEPTH} levels` });
+      throw new McpError(ErrorCode.InvalidParams, `arguments nest deeper than ${MAX_ARG_DEPTH} levels`);
     }
 
     // 3. Fleet policy.
