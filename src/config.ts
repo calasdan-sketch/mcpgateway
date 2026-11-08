@@ -78,6 +78,8 @@ export interface AuthKey {
   id: string;
   key: string;
   scopes: string[];
+  /** glob patterns over public tool names this key may list/call; absent = all */
+  tools?: string[];
 }
 
 export interface AuditConfig {
@@ -484,6 +486,10 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
             else scopes.push(s);
           }
         }
+        const toolsRaw = k['tools'];
+        if (toolsRaw !== undefined && (!Array.isArray(toolsRaw) || !toolsRaw.every(str))) {
+          p.push(`${kc}: "tools" must be an array of glob strings`);
+        }
         if (id && key) {
           if (key.length < 16) p.push(`${kc}: key is shorter than 16 chars — use a long random secret`);
           // The shipped example's default contains "changeme": a gateway started
@@ -491,7 +497,7 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
           if (!authDisabled && /changeme/i.test(key)) {
             p.push(`${kc}: key "${id}" is the shipped placeholder. Set GATEWAY_KEY to a long random secret (e.g. \`node -e "console.log(crypto.randomBytes(32).toString('hex'))"\`)`);
           }
-          keys.push({ id, key, scopes });
+          keys.push(Array.isArray(toolsRaw) ? { id, key, scopes, tools: toolsRaw as string[] } : { id, key, scopes });
         }
       });
     }

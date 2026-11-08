@@ -44,7 +44,7 @@ import type { RateLimiter } from './ratelimit.js';
 import { checkResponse, checkToolCall, isHidden } from './policy.js';
 import { newRequestId, safeJsonStringify, truncate } from './util.js';
 import { VERSION } from './version.js';
-import type { AuthKey, PolicyConfig, RateLimitRule } from './config.js';
+import { matchesAny, type AuthKey, type PolicyConfig, type RateLimitRule } from './config.js';
 
 // ---------------------------------------------------------------------------
 // Routing table
@@ -147,11 +147,16 @@ export class GatewayUpstream {
   createMcpServer(): Server {
     const server = new Server({ name: 'mcpgateway', version: VERSION }, { capabilities: { tools: {}, resources: {}, prompts: {} } });
 
+    const ctxOf = (): { sessionId: string; keyId?: string } =>
+      sessionContext.get(server) ?? { sessionId: 'stdio', keyId: undefined };
+
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       const table = this.deps.getTable();
       const tools: Tool[] = [];
+      const keyId = ctxOf().keyId;
       for (const entry of table.toolMeta.values()) {
         if (isHidden(this.deps.policy, entry.publicName)) continue;
+        if (!this.keyMayUse(keyId, entry.publicName)) continue;
         tools.push({
           name: entry.publicName,
           description: entry.description,
@@ -160,9 +165,6 @@ export class GatewayUpstream {
       }
       return { tools };
     });
-
-    const ctxOf = (): { sessionId: string; keyId?: string } =>
-      sessionContext.get(server) ?? { sessionId: 'stdio', keyId: undefined };
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const name = request.params.name;
@@ -342,6 +344,12 @@ export class GatewayUpstream {
     return null;
   }
 
+  /** Per-key tool allowlist (auth.keys[].tools). No key (stdio) or no list = all tools. */
+  private keyMayUse(keyId: string | undefined, publicName: string): boolean {
+    const tools = this.deps.auth.keys.find((k) => k.id === keyId)?.tools;
+    return tools === undefined || matchesAny(tools, publicName);
+  }
+
   // -- tool call pipeline ----------------------------------------------------------
 
   private async handleToolCall(publicName: string, args: unknown, ctx: { sessionId: string; keyId?: string }): Promise<CallToolResult> {
@@ -400,6 +408,12 @@ export class GatewayUpstream {
     if (isHidden(this.deps.policy, publicName)) {
       metrics.policyDenials.inc({ tool: publicName, reason: 'hidden' });
       finish('denied', { policyReason: 'hidden', errorMessage: `tool "${publicName}" is hidden by policy` });
+      throw new McpError(ErrorCode.InvalidParams, `unknown tool "${truncateName(publicName)}"`);
+    }
+    // Outside this key's tool list: same masking as hidden.
+    if (!this.keyMayUse(ctx.keyId, publicName)) {
+      metrics.policyDenials.inc({ tool: publicName, reason: 'key_scope' });
+      finish('denied', { policyReason: 'key_scope', errorMessage: `tool "${publicName}" is outside key "${ctx.keyId}"'s tool list` });
       throw new McpError(ErrorCode.InvalidParams, `unknown tool "${truncateName(publicName)}"`);
     }
 

@@ -55,6 +55,7 @@ auth:
     - id: agent-1
       key: "${GATEWAY_KEY:-changeme-to-a-long-random-secret}"
       scopes: ["tools:call", "tools:list"]   # + resources:*, prompts:*, admin
+      # tools: ["github__*"]   # optional: this key may only list/call these (HTTP upstream only)
 
 audit:
   path: ./mcpgateway-audit.jsonl

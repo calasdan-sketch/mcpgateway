@@ -149,6 +149,11 @@ commented. Highlights:
 - bearer keys carry scopes: `tools:call`, `tools:list`, `resources:*`,
   `prompts:*`, `admin` (compared in constant time)
 - a Streamable HTTP session id only works with the key that opened it
+- `auth.keys[].tools` (optional glob list over public tool names) limits what
+  one key can list and call; a call outside the list gets the same
+  `unknown tool` error as a missing tool and is audited as `denied` with
+  reason `key_scope`. Without `tools`, a key sees every tool. The stdio
+  upstream has no key, so per-key lists apply to the HTTP upstream only
 - the config file is **trusted operator input** (like `sshd_config`) — `chmod 600`
 
 ## CLI

@@ -620,3 +620,73 @@ test('http: public bind with no allowedHosts warns in validate', async () => {
   assert.ok(configWarnings(cfg).some((w) => w.includes('allowedHosts')));
   assert.deepEqual(cfg.upstream.http.allowedHosts, []);
 });
+
+// ---------------------------------------------------------------------------
+// Per-key tool allowlist (auth.keys[].tools)
+
+test('per-key tools: listing filtered, out-of-scope call looks unknown, audited as key_scope', async () => {
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const fakeA = makeFake('a-srv', { create_issue: () => textResult('ok'), search: () => textResult('s') });
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  await fakeA.server.connect(st);
+  const auditPath = join(mkdtempSync(join(tmpdir(), 'mcpgw-it-')), 'audit.jsonl');
+  const keyA = 'a'.repeat(32);
+  const keyB = 'b'.repeat(32);
+  const cfg = validateConfig({
+    servers: [{ name: 'github', transport: 'stdio', command: 'node' }],
+    namespace: { aliases: { 'github:create_issue': 'github__create_issue', 'github:search': 'docs__search' } },
+    auth: { keys: [
+      { id: 'A', key: keyA, scopes: ['tools:call', 'tools:list'], tools: ['github__*'] },
+      { id: 'B', key: keyB, scopes: ['tools:call', 'tools:list'] },
+    ] },
+    audit: { path: auditPath },
+    admin: { enabled: false },
+    upstream: { stdio: { enabled: false }, http: { enabled: true, host: '127.0.0.1', port: 0 } },
+  } as Raw, 'test');
+  const gw = await startGateway(cfg, { transportOverrides: new Map([['github', ct]]), noAdmin: true, log: () => undefined });
+  const port = (gw.httpServer?.address() as import('node:net').AddressInfo).port;
+  const connect = async (key: string) => {
+    const c = new Client({ name: 't', version: '1' }, { capabilities: {} });
+    await c.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), {
+      requestInit: { headers: { authorization: `Bearer ${key}` } },
+    }));
+    return c;
+  };
+  const a = await connect(keyA);
+  const b = await connect(keyB);
+  try {
+    assert.deepEqual((await a.listTools()).tools.map((t) => t.name), ['github__create_issue']);
+    assert.deepEqual((await b.listTools()).tools.map((t) => t.name).sort(), ['docs__search', 'github__create_issue']);
+    const errOf = async (name: string) => {
+      try {
+        await a.callTool({ name, arguments: {} });
+        return 'no error';
+      } catch (e) {
+        return (e as Error).message.replace(name, '<name>');
+      }
+    };
+    assert.equal(await errOf('docs__search'), await errOf('zz__nonexistent'));
+    assert.equal(fakeA.calls.length, 0);
+    const rec = auditRecords({ auditPath } as Harness).find((r) => r['tool'] === 'docs__search');
+    assert.equal(rec?.['keyId'], 'A');
+    assert.equal(rec?.['status'], 'denied');
+    assert.equal(rec?.['policyReason'], 'key_scope');
+    const r = await b.callTool({ name: 'docs__search', arguments: {} });
+    assert.equal((r.content as Array<{ text: string }>)[0]?.text, 's');
+  } finally {
+    await a.close().catch(() => undefined);
+    await b.close().catch(() => undefined);
+    await gw.close();
+    await fakeA.server.close().catch(() => undefined);
+  }
+});
+
+test('per-key tools must be a list', () => {
+  assert.throws(
+    () => validateConfig({
+      servers: [{ name: 'a', transport: 'stdio', command: 'node' }],
+      auth: { keys: [{ id: 'A', key: 'a'.repeat(32), tools: 'github__*' }] },
+    } as Raw, 'test'),
+    /tools/,
+  );
+});
