@@ -119,7 +119,8 @@ failures are counted and surfaced on `/healthz`.
 Prometheus text on the admin port: `mcpgateway_tool_calls_total`,
 `mcpgateway_tool_call_duration_seconds` (histogram), `mcpgateway_server_up`,
 `mcpgateway_server_inflight`, `mcpgateway_policy_denials_total`,
-`mcpgateway_rate_limit_hits_total`, `mcpgateway_audit_errors_total`.
+`mcpgateway_rate_limit_hits_total`, `mcpgateway_audit_errors_total`,
+`mcpgateway_http_rejected_total`.
 
 ### Admin API (default `http://127.0.0.1:3001`)
 
@@ -184,9 +185,15 @@ mcpgateway init [-o out.yaml]         # write the starter config
 - **Audit is local JSONL.** Rotation is bounded, but shipping to a SIEM is
   your job (filebeat/vector sidecar).
 - **Metrics are Prometheus-text only.** No OTel exporter in v1.
-- **HTTP upstream has no CSRF/DNS-rebinding hardening** beyond bearer auth —
-  bind it to localhost or put it behind your own reverse proxy with origin
-  checks for browser-adjacent use.
+- **Origin/Host checks are allow-lists, nothing more.** Before auth, the HTTP
+  upstream answers 403 when an `Origin` header is present and not in
+  `upstream.http.allowedOrigins` (exact match; default empty, so any browser
+  origin is refused), and when the `Host` header is not in
+  `upstream.http.allowedHosts` (an entry without a port matches any port). A
+  loopback bind defaults `allowedHosts` to `localhost`, `127.0.0.1`, `[::1]`;
+  a non-loopback bind defaults to no Host check and `validate` warns. Requests
+  with no `Origin` (CLI and SDK clients) pass the Origin check. Rejections are
+  counted in `mcpgateway_http_rejected_total{reason}` and logged to stderr.
 - **No SSE resumability.** No event store: if a Streamable HTTP connection
   drops, clients reconnect and start a new session. Sessions are capped
   (`maxSessions`, default 128) so abandoned ones can't exhaust memory.

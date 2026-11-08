@@ -117,7 +117,12 @@ export interface UpstreamDeps {
   maxResultChars: number;
   /** max concurrent Streamable HTTP sessions — abandoned sessions can't grow forever */
   httpMaxSessions: number;
+  /** Origin/Host allow-lists for the HTTP upstream (see config) */
+  httpAllowedOrigins: string[];
+  httpAllowedHosts: string[];
   auth: UpstreamAuth;
+  /** operational log line (stderr) */
+  log: (msg: string) => void;
 }
 
 interface AuthedKey {
@@ -226,6 +231,22 @@ export class GatewayUpstream {
     res: ServerResponse,
     sessions: Map<string, { transport: StreamableHTTPServerTransport; keyId: string }>,
   ): Promise<void> {
+    // DNS-rebinding / cross-site guard, before auth and session lookup.
+    // Requests with no Origin (non-browser clients) pass the Origin check.
+    const origin = req.headers['origin'];
+    const host = req.headers['host'] ?? '';
+    const reason =
+      origin !== undefined && !this.deps.httpAllowedOrigins.includes(origin) ? 'origin'
+        : this.deps.httpAllowedHosts.length > 0 && !hostAllowed(host, this.deps.httpAllowedHosts) ? 'host'
+          : null;
+    if (reason !== null) {
+      this.deps.metrics.httpRejected.inc({ reason });
+      this.deps.log(`[mcpgateway] rejected HTTP request: ${reason} ${JSON.stringify(truncate(reason === 'origin' ? String(origin) : host, 200).text)}`);
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message: `forbidden: ${reason} not allowed` } }));
+      return;
+    }
+
     const url = new URL(req.url ?? '/', 'http://localhost');
     if (url.pathname !== '/mcp') {
       res.writeHead(404, { 'content-type': 'application/json' });
@@ -572,6 +593,13 @@ export function scopeForMethod(method: string): string | null {
   }
   if (method === 'prompts/list' || method === 'prompts/get') return 'prompts:*';
   return null; // initialize, ping, notifications, completion — any authed key
+}
+
+/** Host header matches an entry exactly, or by hostname when the entry has no port. */
+function hostAllowed(host: string, allowed: string[]): boolean {
+  const h = host.toLowerCase();
+  const name = h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.split(':')[0];
+  return allowed.some((a) => a.toLowerCase() === h || a.toLowerCase() === name);
 }
 
 function truncateName(name: string): string {

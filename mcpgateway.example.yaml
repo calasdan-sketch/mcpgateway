@@ -76,6 +76,9 @@ upstream:
     host: 127.0.0.1
     port: 3000
     maxSessions: 128    # abandoned SSE sessions can't grow this table forever
+    allowedOrigins: []  # browser Origins allowed (exact); any other Origin -> 403
+    # allowedHosts: [localhost, 127.0.0.1, "[::1]"]   # default on a loopback bind;
+    #   set it when binding non-loopback (Host header check, DNS-rebinding guard)
 
 globalMaxInflight: 256    # hard cap on concurrent tool calls gateway-wide
 maxResultChars: 10000000  # drop tool results larger than this (OOM guard)

@@ -98,7 +98,16 @@ export interface AdminConfig {
 
 export interface UpstreamConfig {
   stdio: { enabled: boolean };
-  http: { enabled: boolean; host: string; port: number; maxSessions: number };
+  http: {
+    enabled: boolean;
+    host: string;
+    port: number;
+    maxSessions: number;
+    /** exact Origin values accepted; a request with any other Origin gets 403 */
+    allowedOrigins: string[];
+    /** accepted Host header names (port optional); empty = no Host check */
+    allowedHosts: string[];
+  };
 }
 
 export interface GatewayConfig {
@@ -549,7 +558,7 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
   const httpRaw = isRaw(upRaw['http']) ? (upRaw['http'] as Raw) : {};
   const upstream: UpstreamConfig = {
     stdio: { enabled: stdioRaw['enabled'] !== undefined ? stdioRaw['enabled'] === true : true },
-    http: { enabled: false, host: '127.0.0.1', port: 3000, maxSessions: 128 },
+    http: { enabled: false, host: '127.0.0.1', port: 3000, maxSessions: 128, allowedOrigins: [], allowedHosts: [] },
   };
   if (typeof stdioRaw['enabled'] !== 'undefined' && typeof stdioRaw['enabled'] !== 'boolean') {
     p.push(ctx('upstream.stdio.enabled must be boolean'));
@@ -564,6 +573,16 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
   }
   upstream.http.port = optNum(httpRaw, 'port', ctx('upstream.http'), 3000, 0, p);
   upstream.http.maxSessions = optNum(httpRaw, 'maxSessions', ctx('upstream.http'), 128, 1, p);
+  upstream.http.allowedOrigins = strArray(httpRaw, 'allowedOrigins', ctx('upstream.http'), p);
+  // DNS-rebinding guard: a loopback bind only answers to loopback Host names
+  // unless the operator lists others. A public bind can't guess its names.
+  if (httpRaw['allowedHosts'] !== undefined) {
+    upstream.http.allowedHosts = strArray(httpRaw, 'allowedHosts', ctx('upstream.http'), p);
+  } else if (isLocalhost(upstream.http.host)) {
+    upstream.http.allowedHosts = ['localhost', '127.0.0.1', '[::1]'];
+  } else if (upstream.http.enabled) {
+    p.push(ctx(`WARNING: upstream.http.host "${upstream.http.host}" is not loopback and upstream.http.allowedHosts is empty — no Host-header (DNS-rebinding) check; list the names clients use`));
+  }
   if (!upstream.stdio.enabled && !upstream.http.enabled) {
     p.push(ctx('at least one upstream transport (stdio or http) must be enabled'));
   }
@@ -612,7 +631,7 @@ export function configWarnings(cfg: GatewayConfig): string[] {
 
 function isLocalhost(host: string): boolean {
   const h = host.toLowerCase();
-  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h.endsWith('.localhost');
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]' || h.endsWith('.localhost');
 }
 
 function isPublicBind(host: string): boolean {

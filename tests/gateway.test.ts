@@ -528,3 +528,95 @@ test('audit write failures increment mcpgateway_audit_errors_total', async () =>
   assert.equal(logger.errors, 1);
   assert.equal(calls, 1);
 });
+
+// ---------------------------------------------------------------------------
+// Origin / Host validation (DNS rebinding)
+
+async function startHttpGateway(httpOver: Record<string, unknown> = {}) {
+  const fakeA = makeFake('a-srv', { ping: () => textResult('p') });
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  await fakeA.server.connect(st);
+  const auditPath = join(mkdtempSync(join(tmpdir(), 'mcpgw-it-')), 'audit.jsonl');
+  const key = 'k'.repeat(32);
+  const cfg = validateConfig({
+    servers: [{ name: 'a', transport: 'stdio', command: 'node' }],
+    auth: { keys: [{ id: 'k1', key, scopes: ['tools:call', 'tools:list'] }] },
+    audit: { path: auditPath },
+    admin: { enabled: false },
+    upstream: { stdio: { enabled: false }, http: { enabled: true, host: '127.0.0.1', port: 0, ...httpOver } },
+  } as Raw, 'test');
+  const gw = await startGateway(cfg, { transportOverrides: new Map([['a', ct]]), noAdmin: true, log: () => undefined });
+  const port = (gw.httpServer?.address() as import('node:net').AddressInfo).port;
+  const { request } = await import('node:http');
+  // node:http (not fetch) so the test can set any Host header.
+  const post = (headers: Record<string, string>): Promise<{ status: number; body: string }> =>
+    new Promise((resolve, reject) => {
+      const body = JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } },
+      });
+      const req = request({
+        host: '127.0.0.1', port, path: '/mcp', method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...headers },
+      }, (res) => {
+        let data = '';
+        res.on('data', (c: Buffer) => {
+          data += c.toString('utf8');
+          if (data.includes('protocolVersion')) res.destroy(); // SSE stream stays open; first event is enough
+        });
+        res.on('close', () => resolve({ status: res.statusCode ?? 0, body: data }));
+      });
+      req.on('error', reject);
+      req.end(body);
+    });
+  return {
+    gw, key, port, post,
+    close: async () => {
+      await gw.close();
+      await fakeA.server.close().catch(() => undefined);
+    },
+  };
+}
+
+test('http: foreign Origin is rejected with 403 before auth', async () => {
+  const h = await startHttpGateway({ allowedOrigins: ['http://app.example'] });
+  try {
+    const evil = await h.post({ authorization: `Bearer ${h.key}`, origin: 'http://evil.example' });
+    assert.equal(evil.status, 403);
+    assert.match(evil.body, /"jsonrpc":"2.0"/);
+    const evilNoKey = await h.post({ authorization: 'Bearer wrong', origin: 'http://evil.example' });
+    assert.equal(evilNoKey.status, 403); // 403, not 401: Origin is checked before auth
+    const allowed = await h.post({ authorization: `Bearer ${h.key}`, origin: 'http://app.example' });
+    assert.equal(allowed.status, 200);
+    assert.match(allowed.body, /protocolVersion/);
+    const none = await h.post({ authorization: `Bearer ${h.key}` });
+    assert.equal(none.status, 200);
+    assert.ok(h.gw.metrics.render().includes('mcpgateway_http_rejected_total{reason="origin"} 2'));
+  } finally {
+    await h.close();
+  }
+});
+
+test('http: loopback bind rejects a foreign Host header (DNS rebinding)', async () => {
+  const h = await startHttpGateway();
+  try {
+    const rebound = await h.post({ authorization: `Bearer ${h.key}`, host: 'evil.example:3000' });
+    assert.equal(rebound.status, 403);
+    const local = await h.post({ authorization: `Bearer ${h.key}`, host: `localhost:${h.port}` });
+    assert.equal(local.status, 200);
+    assert.ok(h.gw.metrics.render().includes('mcpgateway_http_rejected_total{reason="host"} 1'));
+  } finally {
+    await h.close();
+  }
+});
+
+test('http: public bind with no allowedHosts warns in validate', async () => {
+  const cfg = validateConfig({
+    servers: [{ name: 'a', transport: 'stdio', command: 'node' }],
+    auth: { disabled: true },
+    upstream: { http: { enabled: true, host: '0.0.0.0' } },
+  } as Raw, 'test');
+  const { configWarnings } = await import('../src/config.js');
+  assert.ok(configWarnings(cfg).some((w) => w.includes('allowedHosts')));
+  assert.deepEqual(cfg.upstream.http.allowedHosts, []);
+});

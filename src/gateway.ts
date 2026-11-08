@@ -120,7 +120,10 @@ export async function startGateway(cfg: GatewayConfig, opts: StartOptions = {}):
     globalMaxInflight: cfg.globalMaxInflight,
     maxResultChars: cfg.maxResultChars,
     httpMaxSessions: cfg.upstream.http.maxSessions,
+    httpAllowedOrigins: cfg.upstream.http.allowedOrigins,
+    httpAllowedHosts: cfg.upstream.http.allowedHosts,
     auth: cfg.auth,
+    log,
   };
   const upstream = new GatewayUpstream(deps);
 
