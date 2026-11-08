@@ -1,5 +1,5 @@
 /**
- * CLI: serve | validate | namespace | init
+ * CLI: serve | validate | namespace | init | pin | import
  *
  * In stdio upstream mode, stdout is the MCP channel — ALL operational logging
  * goes to stderr.
@@ -8,7 +8,8 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ConfigError, configWarnings, loadConfigFile } from './config.js';
+import { stringify as stringifyYaml } from 'yaml';
+import { ConfigError, DEFAULT_REDACT_KEYS, configWarnings, loadConfigFile } from './config.js';
 import { startGateway } from './gateway.js';
 import { buildNamespace } from './namespace.js';
 import { DownstreamServer } from './downstream.js';
@@ -24,6 +25,7 @@ Usage:
   mcpgateway namespace [-c config.yaml] Connect and print the unified tool table
   mcpgateway init [-o out.yaml]         Write a commented starter config
   mcpgateway pin [-c config] [-o pins.json]  Connect and write tool-definition pins (stdout without -o)
+  mcpgateway import <.mcp.json>        Print a servers: block converted from a Claude-style .mcp.json
   mcpgateway --version | --help
 
 Options:
@@ -43,10 +45,12 @@ interface Args {
   http: boolean;
   output: string;
   force: boolean;
+  /** first positional after the command (import: path) */
+  target: string;
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { command: '', config: './mcpgateway.yaml', network: false, http: false, output: '', force: false };
+  const args: Args = { command: '', config: './mcpgateway.yaml', network: false, http: false, output: '', force: false, target: '' };
   const rest: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] as string;
@@ -61,6 +65,7 @@ function parseArgs(argv: string[]): Args {
     else throw new Error(`unknown flag "${a}" (see --help)`);
   }
   if (rest.length > 0) args.command = rest[0] as string;
+  if (rest.length > 1) args.target = rest[1] as string;
   return args;
 }
 
@@ -100,6 +105,9 @@ export async function main(argv: string[]): Promise<void> {
       return;
     case 'namespace':
       await cmdNamespace(args);
+      return;
+    case 'import':
+      cmdImport(args);
       return;
     case 'pin':
       await cmdPin(args);
@@ -233,6 +241,74 @@ async function cmdPin(args: Args): Promise<void> {
   } finally {
     await Promise.all(servers.map((s) => s.close().catch(() => undefined)));
   }
+}
+
+/**
+ * Convert a Claude-style .mcp.json object to gateway `servers:` entries.
+ * Literal values under secret-looking env/header names become ${NAME}
+ * references, so secrets never land in the generated YAML.
+ */
+export function mcpJsonToServers(data: unknown): { servers: Array<Record<string, unknown>>; notes: string[] } {
+  const obj = (data ?? {}) as Record<string, unknown>;
+  const src = (obj['mcpServers'] ?? obj['servers'] ?? obj) as Record<string, unknown>;
+  const servers: Array<Record<string, unknown>> = [];
+  const notes: string[] = [];
+  const used = new Set<string>();
+  const secretKey = (k: string) => DEFAULT_REDACT_KEYS.some((r) => k.toLowerCase().includes(r));
+  const scrub = (map: unknown, server: string): Record<string, string> | undefined => {
+    if (map === null || typeof map !== 'object') return undefined;
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(map as Record<string, unknown>)) {
+      const value = String(v);
+      if (secretKey(k) && !/^[$][{][A-Za-z_][A-Za-z0-9_]*(:-.*)?[}]$/.test(value)) {
+        const envName = k.toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+        out[k] = '${' + envName + '}';
+        notes.push(`server "${server}": ${k} replaced with \${${envName}} — export ${envName} before serve`);
+      } else {
+        out[k] = value;
+      }
+    }
+    return out;
+  };
+  for (const [rawName, entry] of Object.entries(src)) {
+    if (entry === null || typeof entry !== 'object') continue;
+    const e = entry as Record<string, unknown>;
+    const base = rawName.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/^[^a-z0-9]+/, '').slice(0, 29) || 'server';
+    let name = base;
+    for (let n = 2; used.has(name); n++) name = `${base}-${n}`;
+    used.add(name);
+    if (typeof e['command'] === 'string') {
+      const s: Record<string, unknown> = { name, transport: 'stdio', command: e['command'] };
+      if (Array.isArray(e['args'])) s['args'] = e['args'].map(String);
+      const env = scrub(e['env'], name);
+      if (env !== undefined) s['env'] = env;
+      servers.push(s);
+    } else if (typeof e['url'] === 'string') {
+      if (e['type'] === 'sse') notes.push(`server "${name}": legacy SSE transport — the gateway speaks Streamable HTTP only; check the server supports it`);
+      const s: Record<string, unknown> = { name, transport: 'http', url: e['url'] };
+      const headers = scrub(e['headers'], name);
+      if (headers !== undefined) s['headers'] = headers;
+      servers.push(s);
+    } else {
+      notes.push(`server "${rawName}": no command or url — skipped`);
+    }
+  }
+  return { servers, notes };
+}
+
+function cmdImport(args: Args): void {
+  let data: unknown;
+  try {
+    data = JSON.parse(readFileSync(args.target, 'utf8'));
+  } catch (e) {
+    console.error(args.target === '' ? 'error: usage: mcpgateway import <path-to-.mcp.json>'
+      : `error: ${args.target} is unreadable or not valid JSON: ${(e as Error).message}`);
+    process.exitCode = 2;
+    return;
+  }
+  const { servers, notes } = mcpJsonToServers(data);
+  for (const n of notes) console.error(`note: ${n}`);
+  process.stdout.write(stringifyYaml({ servers }));
 }
 
 function loadConfigOrExit(path: string, noNetwork: boolean) {

@@ -41,6 +41,22 @@ mcpgateway namespace -c mcpgateway.yaml   # preview the unified tool table
 mcpgateway serve -c mcpgateway.yaml
 ```
 
+Already have a `.mcp.json`? Convert it instead of retyping servers:
+
+```bash
+mcpgateway import .mcp.json > servers.yaml   # paste the servers: block into mcpgateway.yaml
+```
+
+`import` reads `mcpServers` (or `servers`, or a top-level map). Entries with
+`command` become `transport: stdio` (with `args` and `env`); entries with `url`
+become `transport: http` (with `headers`). Names are lowercased and other
+characters become `-`; clashes get `-2`, `-3`. Any `env` or `headers` value
+whose name looks secret (same list as the audit `redactKeys` default: `token`,
+`secret`, `password`, `authorization`, ...) is replaced with `${NAME}` and a
+note on stderr tells you which variable to export, so the secret is never
+written to the YAML. Values under other names are copied as-is, so check the
+output before committing it. Invalid JSON exits `2`.
+
 Point your agent at it (stdio drop-in):
 
 ```json
@@ -209,6 +225,7 @@ mcpgateway validate [-c config.yaml]  # config checks; --network adds reachabili
 mcpgateway namespace [-c config.yaml] # connect + print the unified tool table
 mcpgateway init [-o out.yaml]         # write the starter config
 mcpgateway pin [-c config.yaml] [-o pins.json]  # connect + write tool-definition pins
+mcpgateway import .mcp.json            # print a servers: block from a Claude-style config
 ```
 
 ## Limitations (honest)

@@ -135,6 +135,8 @@ export interface GatewayConfig {
   pinning: PinningConfig;
 }
 
+export const DEFAULT_REDACT_KEYS = ['token', 'secret', 'password', 'passwd', 'api_key', 'apikey', 'authorization', 'cookie', 'session', 'credential'];
+
 export const VALID_SCOPES = ['tools:call', 'tools:list', 'resources:*', 'prompts:*', 'admin'] as const;
 
 const SERVER_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
@@ -521,7 +523,7 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
   const audit: AuditConfig = {
     path: './mcpgateway-audit.jsonl',
     logArgs: true,
-    redactKeys: ['token', 'secret', 'password', 'passwd', 'api_key', 'apikey', 'authorization', 'cookie', 'session', 'credential'],
+    redactKeys: [...DEFAULT_REDACT_KEYS],
     maxArgsChars: 8192,
     maxSizeMB: 100,
     keepFiles: 5,
