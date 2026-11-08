@@ -205,8 +205,7 @@ function cmdInit(args: Args): void {
   writeFileSync(args.output, example, 'utf8');
   console.log(`wrote ${args.output} — edit it, then run: mcpgateway validate -c ${args.output}`);
   // Printed, never written: the config file may get committed.
-  console.log(`generated a gateway key (not saved to the file) — set it in your environment:
-  export GATEWAY_KEY=${randomBytes(32).toString('hex')}`);
+  console.log(`generated a gateway key (not saved to the file) — set it in your environment:\n  export GATEWAY_KEY=${randomBytes(32).toString('hex')}`);
 }
 
 function loadConfigOrExit(path: string, noNetwork: boolean) {
