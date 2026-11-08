@@ -142,6 +142,7 @@ commented. Highlights:
   safe-default set plus your `env` block
 - bearer keys carry scopes: `tools:call`, `tools:list`, `resources:*`,
   `prompts:*`, `admin` (compared in constant time)
+- a Streamable HTTP session id only works with the key that opened it
 - the config file is **trusted operator input** (like `sshd_config`) — `chmod 600`
 
 ## CLI
@@ -195,7 +196,7 @@ mcpgateway init [-o out.yaml]         # write the starter config
 
 ```bash
 npm install
-npm test        # build + 77 tests (unit + in-process integration)
+npm test        # build + unit and in-process integration tests
 npm run lint    # tsc --noEmit (strict)
 ```
 

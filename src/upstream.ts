@@ -201,7 +201,10 @@ export class GatewayUpstream {
   // -- Streamable HTTP upstream -------------------------------------------------
 
   listenHttp(host: string, port: number): Promise<HttpServer> {
-    const sessions = new Map<string, StreamableHTTPServerTransport>();
+    // Each session is bound to the key that created it: another valid key
+    // presenting the id gets 'unknown mcp-session-id' (no hijack, and audit
+    // records can't be misattributed to the session creator).
+    const sessions = new Map<string, { transport: StreamableHTTPServerTransport; keyId: string }>();
     const httpServer = createHttpServer((req, res) => {
       void this.handleHttp(req, res, sessions).catch((e) => {
         this.deps.metrics.upstreamErrors.inc({});
@@ -221,7 +224,7 @@ export class GatewayUpstream {
   private async handleHttp(
     req: IncomingMessage,
     res: ServerResponse,
-    sessions: Map<string, StreamableHTTPServerTransport>,
+    sessions: Map<string, { transport: StreamableHTTPServerTransport; keyId: string }>,
   ): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://localhost');
     if (url.pathname !== '/mcp') {
@@ -251,7 +254,8 @@ export class GatewayUpstream {
         }
       }
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
-      let transport: StreamableHTTPServerTransport | undefined = sessionId !== undefined ? sessions.get(sessionId) : undefined;
+      const entry = sessionId !== undefined ? sessions.get(sessionId) : undefined;
+      let transport: StreamableHTTPServerTransport | undefined = entry?.keyId === authed.keyId ? entry.transport : undefined;
       if (transport === undefined) {
         if (sessionId !== undefined) {
           res.writeHead(400, { 'content-type': 'application/json' });
@@ -269,7 +273,7 @@ export class GatewayUpstream {
         const newTransport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (id) => {
-            sessions.set(id, newTransport);
+            sessions.set(id, { transport: newTransport, keyId: authed.keyId });
             // Real session id for audit records on this session's calls.
             sessionContext.set(server, { sessionId: id, keyId: authed.keyId });
           },
@@ -286,7 +290,8 @@ export class GatewayUpstream {
 
     if (req.method === 'GET' || req.method === 'DELETE') {
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
-      const transport = sessionId !== undefined ? sessions.get(sessionId) : undefined;
+      const entry = sessionId !== undefined ? sessions.get(sessionId) : undefined;
+      const transport = entry?.keyId === authed.keyId ? entry.transport : undefined;
       if (transport === undefined) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'unknown mcp-session-id' }));
