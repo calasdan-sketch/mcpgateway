@@ -136,3 +136,14 @@ test('global limits have safe defaults', () => {
   assert.equal(cfg.maxResultChars, 10_000_000);
   assert.equal(cfg.upstream.http.maxSessions, 128);
 });
+
+test('auth: shipped placeholder / changeme keys rejected', () => {
+  const withKey = (key: string, disabled = false) => base({ auth: { disabled, keys: [{ id: 'k', key, scopes: ['tools:call'] }] } });
+  assert.throws(
+    () => validateConfig(withKey('changeme-to-a-long-random-secret'), 'test'),
+    (e: unknown) => e instanceof ConfigError && /placeholder/.test(e.message) && /GATEWAY_KEY/.test(e.message),
+  );
+  assert.throws(() => validateConfig(withKey('XchangeMEX0123456789'), 'test'), (e: unknown) => e instanceof ConfigError && /placeholder/.test(e.message));
+  assert.doesNotThrow(() => validateConfig(withKey('0123456789abcdef'.repeat(4)), 'test'));
+  assert.doesNotThrow(() => validateConfig(withKey('changeme-to-a-long-random-secret', true), 'test'));
+});

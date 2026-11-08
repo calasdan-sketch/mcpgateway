@@ -477,6 +477,11 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
         }
         if (id && key) {
           if (key.length < 16) p.push(`${kc}: key is shorter than 16 chars — use a long random secret`);
+          // The shipped example's default contains "changeme": a gateway started
+          // without GATEWAY_KEY must not run on a key published in the repo.
+          if (!authDisabled && /changeme/i.test(key)) {
+            p.push(`${kc}: key "${id}" is the shipped placeholder. Set GATEWAY_KEY to a long random secret (e.g. \`node -e "console.log(crypto.randomBytes(32).toString('hex'))"\`)`);
+          }
           keys.push({ id, key, scopes });
         }
       });

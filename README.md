@@ -33,8 +33,9 @@ Requires Node ≥ 20.
 ## Quickstart
 
 ```bash
-mcpgateway init                    # writes ./mcpgateway.yaml (commented)
-# edit mcpgateway.yaml: add your servers, set GATEWAY_KEY
+mcpgateway init                    # writes ./mcpgateway.yaml and prints a fresh random key
+export GATEWAY_KEY=<the printed key>  # the key is printed, never written to the file
+# edit mcpgateway.yaml: add your servers
 mcpgateway validate -c mcpgateway.yaml
 mcpgateway namespace -c mcpgateway.yaml   # preview the unified tool table
 mcpgateway serve -c mcpgateway.yaml
@@ -140,6 +141,10 @@ commented. Highlights:
   default = startup error naming the variable)
 - stdio servers spawn with `shell: false` and an argv array; env is a small
   safe-default set plus your `env` block
+- `validate`/`serve` refuse any key containing `changeme` (the example
+  file's fallback), so a gateway started without `GATEWAY_KEY` fails instead
+  of running on a key that is public in this repo; keys under 16 chars are
+  refused too
 - bearer keys carry scopes: `tools:call`, `tools:list`, `resources:*`,
   `prompts:*`, `admin` (compared in constant time)
 - a Streamable HTTP session id only works with the key that opened it
