@@ -112,6 +112,11 @@ export interface UpstreamConfig {
   };
 }
 
+export interface PinningConfig {
+  mode: 'off' | 'warn' | 'quarantine';
+  file?: string;
+}
+
 export interface GatewayConfig {
   name: string;
   servers: ServerConfig[];
@@ -125,6 +130,7 @@ export interface GatewayConfig {
   upstream: UpstreamConfig;
   globalMaxInflight: number;
   maxResultChars: number;
+  pinning: PinningConfig;
 }
 
 export const VALID_SCOPES = ['tools:call', 'tools:list', 'resources:*', 'prompts:*', 'admin'] as const;
@@ -593,13 +599,25 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
     p.push(ctx('at least one upstream transport (stdio or http) must be enabled'));
   }
 
+  // ---- pinning ----
+  const pinRaw = isRaw(raw['pinning']) ? (raw['pinning'] as Raw) : {};
+  const pinning: PinningConfig = { mode: 'warn' };
+  if (pinRaw['mode'] !== undefined) {
+    if (pinRaw['mode'] !== 'off' && pinRaw['mode'] !== 'warn' && pinRaw['mode'] !== 'quarantine') p.push(ctx('pinning.mode must be off|warn|quarantine'));
+    else pinning.mode = pinRaw['mode'];
+  }
+  if (pinRaw['file'] !== undefined) {
+    if (!str(pinRaw['file'])) p.push(ctx('pinning.file must be a string'));
+    else pinning.file = pinRaw['file'];
+  }
+
   // ---- global limits ----
   const globalMaxInflight = optNum(raw, 'globalMaxInflight', source, 256, 1, p);
   const maxResultChars = optNum(raw, 'maxResultChars', source, 10_000_000, 1024, p);
 
   // unknown top-level keys: warn via problems? Panel said warn, not fail.
   // We surface them as warnings through the returned config instead.
-  const knownTop = new Set(['gateway', 'servers', 'namespace', 'rateLimits', 'policy', 'auth', 'audit', 'admin', 'upstream', 'globalMaxInflight', 'maxResultChars']);
+  const knownTop = new Set(['gateway', 'servers', 'namespace', 'rateLimits', 'policy', 'auth', 'audit', 'admin', 'upstream', 'globalMaxInflight', 'maxResultChars', 'pinning']);
   const unknownTop = Object.keys(raw).filter((k) => !knownTop.has(k));
   if (unknownTop.length > 0) {
     // non-fatal: attach to stderr at serve time via a thrown-adjacent channel.
@@ -625,6 +643,7 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
     upstream,
     globalMaxInflight,
     maxResultChars,
+    pinning,
   };
   (cfg as { __warnings?: string[] }).__warnings = warnings;
   return cfg;

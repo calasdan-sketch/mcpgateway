@@ -105,6 +105,35 @@ human approvals), pair it with
 *which* tools exist and *who* may call them; the jail decides *how* each
 server's tools may be used.
 
+### Tool-definition pinning (rug-pull guard)
+
+A server can change a tool's description or schema after you approved it.
+The gateway fingerprints each downstream tool (sha256 over the canonical JSON
+of `name`, `title`, `description`, `inputSchema`, `outputSchema`,
+`annotations`; key order does not matter) and compares it with a pin on
+startup and on every `list_changed`.
+
+```yaml
+pinning:
+  mode: warn          # off | warn (default) | quarantine
+  file: pins.json     # optional; without it, tools are pinned on first sight at startup (in memory)
+```
+
+- `warn`: a changed tool is still served; one `pin_mismatch` audit record
+  (old and new hash, and the changed field names when the old definition was
+  seen in this process) and `mcpgateway_pin_mismatch_total{server}`. A tool
+  with no pin gets a `pin_new` record.
+- `quarantine`: the same records, and the changed or unpinned tool is removed
+  from `tools/list`; calls get the ordinary `unknown tool` error.
+- `/healthz` reports `pinMismatches`.
+- `mcpgateway pin -c mcpgateway.yaml -o pins.json` writes the pins (sorted,
+  stable bytes). To accept a change, re-run it and review the file diff.
+  There is no accept API.
+
+Pinning detects definition changes. It cannot detect a server that keeps its
+definition and changes behaviour. Without `file`, pins live in memory only, so
+a restart re-trusts whatever the servers serve at that moment.
+
 ### Audit & metrics
 
 One JSONL record per call: timestamp, request id, session, key id, tool,
@@ -120,7 +149,7 @@ Prometheus text on the admin port: `mcpgateway_tool_calls_total`,
 `mcpgateway_tool_call_duration_seconds` (histogram), `mcpgateway_server_up`,
 `mcpgateway_server_inflight`, `mcpgateway_policy_denials_total`,
 `mcpgateway_rate_limit_hits_total`, `mcpgateway_audit_errors_total`,
-`mcpgateway_http_rejected_total`.
+`mcpgateway_http_rejected_total`, `mcpgateway_pin_mismatch_total`.
 
 ### Admin API (default `http://127.0.0.1:3001`)
 
@@ -163,6 +192,7 @@ mcpgateway serve [-c config.yaml]     # stdio upstream by default; logs to stder
 mcpgateway validate [-c config.yaml]  # config checks; --network adds reachability
 mcpgateway namespace [-c config.yaml] # connect + print the unified tool table
 mcpgateway init [-o out.yaml]         # write the starter config
+mcpgateway pin [-c config.yaml] [-o pins.json]  # connect + write tool-definition pins
 ```
 
 ## Limitations (honest)

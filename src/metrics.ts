@@ -110,6 +110,7 @@ export class Metrics {
   readonly rateLimitHits = new Counter('mcpgateway_rate_limit_hits_total', 'Tool calls rejected by rate limiting.');
   readonly auditErrors = new Counter('mcpgateway_audit_errors_total', 'Audit log write failures (never fatal to requests).');
   readonly upstreamErrors = new Counter('mcpgateway_upstream_errors_total', 'Upstream transport errors.');
+  readonly pinMismatch = new Counter('mcpgateway_pin_mismatch_total', 'Tool definitions that no longer match their pin.');
   readonly httpRejected = new Counter('mcpgateway_http_rejected_total', 'HTTP upstream requests rejected by the Origin/Host check.');
   readonly serverUp = new Gauge('mcpgateway_server_up', '1 when the downstream server is connected and healthy.');
   readonly serverInflight = new Gauge('mcpgateway_server_inflight', 'Tool calls currently executing per downstream server.');
@@ -126,6 +127,7 @@ export class Metrics {
       this.auditErrors.render(),
       this.upstreamErrors.render(),
       this.httpRejected.render(),
+      this.pinMismatch.render(),
       this.serverUp.render(),
       this.serverInflight.render(),
       this.gatewayInflight.render(),

@@ -16,7 +16,7 @@ import { appendFileSync, existsSync, renameSync, statSync, unlinkSync, writeFile
 import { nowIso, safeJsonStringify, truncate } from './util.js';
 import type { AuditConfig } from './config.js';
 
-export type AuditStatus = 'ok' | 'error' | 'denied' | 'rate_limited' | 'timeout' | 'blocked' | 'auth_failed';
+export type AuditStatus = 'ok' | 'error' | 'denied' | 'rate_limited' | 'timeout' | 'blocked' | 'auth_failed' | 'pin_mismatch' | 'pin_new';
 
 export interface AuditRecord {
   ts: string;
@@ -37,6 +37,8 @@ export interface AuditRecord {
   argsHash?: string;
   policyReason?: string;
   redactions?: number;
+  /** pinning events: pinned vs current hash, changed field names when known */
+  pin?: { old?: string; new: string; fields?: string[] };
 }
 
 const REDACTED = '[REDACTED]';

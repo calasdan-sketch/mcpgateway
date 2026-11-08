@@ -12,6 +12,7 @@ import { ConfigError, configWarnings, loadConfigFile } from './config.js';
 import { startGateway } from './gateway.js';
 import { buildNamespace } from './namespace.js';
 import { DownstreamServer } from './downstream.js';
+import { pinsFileContent } from './pinning.js';
 import { VERSION } from './version.js';
 
 const HELP = `mcpgateway ${VERSION} — one process fronting all your MCP servers.
@@ -22,13 +23,14 @@ Usage:
   mcpgateway validate [-c config.yaml]  Validate config (add --network for reachability checks)
   mcpgateway namespace [-c config.yaml] Connect and print the unified tool table
   mcpgateway init [-o out.yaml]         Write a commented starter config
+  mcpgateway pin [-c config] [-o pins.json]  Connect and write tool-definition pins (stdout without -o)
   mcpgateway --version | --help
 
 Options:
   -c, --config <path>   Config file (default: ./mcpgateway.yaml)
   --http                serve: enable the Streamable HTTP upstream too
   --network             validate/namespace: check server reachability (validate skips by default)
-  -o, --output <path>   init: output path (default: ./mcpgateway.yaml)
+  -o, --output <path>   init: output path (default: ./mcpgateway.yaml); pin: pins file (default: stdout)
   -f, --force           init: overwrite existing file
 
 Docs: https://github.com/calasdan-sketch/mcpgateway (when published)
@@ -44,7 +46,7 @@ interface Args {
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { command: '', config: './mcpgateway.yaml', network: false, http: false, output: './mcpgateway.yaml', force: false };
+  const args: Args = { command: '', config: './mcpgateway.yaml', network: false, http: false, output: '', force: false };
   const rest: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] as string;
@@ -98,6 +100,9 @@ export async function main(argv: string[]): Promise<void> {
       return;
     case 'namespace':
       await cmdNamespace(args);
+      return;
+    case 'pin':
+      await cmdPin(args);
       return;
     case 'init':
       cmdInit(args);
@@ -187,8 +192,9 @@ async function cmdNamespace(args: Args): Promise<void> {
 }
 
 function cmdInit(args: Args): void {
-  if (existsSync(args.output) && !args.force) {
-    console.error(`error: ${args.output} already exists (use --force to overwrite)`);
+  const output = args.output || './mcpgateway.yaml';
+  if (existsSync(output) && !args.force) {
+    console.error(`error: ${output} already exists (use --force to overwrite)`);
     process.exitCode = 2;
     return;
   }
@@ -202,10 +208,31 @@ function cmdInit(args: Args): void {
     process.exitCode = 1;
     return;
   }
-  writeFileSync(args.output, example, 'utf8');
-  console.log(`wrote ${args.output} — edit it, then run: mcpgateway validate -c ${args.output}`);
+  writeFileSync(output, example, 'utf8');
+  console.log(`wrote ${output} — edit it, then run: mcpgateway validate -c ${output}`);
   // Printed, never written: the config file may get committed.
   console.log(`generated a gateway key (not saved to the file) — set it in your environment:\n  export GATEWAY_KEY=${randomBytes(32).toString('hex')}`);
+}
+
+async function cmdPin(args: Args): Promise<void> {
+  const cfg = loadConfigOrExit(args.config, false);
+  const servers: DownstreamServer[] = [];
+  try {
+    for (const sc of cfg.servers) {
+      const s = new DownstreamServer(sc, { onCatalogChanged: () => undefined });
+      await s.connect();
+      servers.push(s);
+    }
+    const text = pinsFileContent(servers.map((s) => ({ server: s.name, tools: s.getCatalogs().tools })));
+    if (args.output) {
+      writeFileSync(args.output, text, 'utf8');
+      console.error(`wrote ${args.output} — review the diff, then set pinning.file to it`);
+    } else {
+      process.stdout.write(text);
+    }
+  } finally {
+    await Promise.all(servers.map((s) => s.close().catch(() => undefined)));
+  }
 }
 
 function loadConfigOrExit(path: string, noNetwork: boolean) {

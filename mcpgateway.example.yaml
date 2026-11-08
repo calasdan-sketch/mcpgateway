@@ -81,5 +81,9 @@ upstream:
     # allowedHosts: [localhost, 127.0.0.1, "[::1]"]   # default on a loopback bind;
     #   set it when binding non-loopback (Host header check, DNS-rebinding guard)
 
+pinning:
+  mode: warn              # off | warn | quarantine (hide + deny changed/unpinned tools)
+  # file: ./mcpgateway.pins.json   # from `mcpgateway pin`; without it, pins are taken at startup (in memory)
+
 globalMaxInflight: 256    # hard cap on concurrent tool calls gateway-wide
 maxResultChars: 10000000  # drop tool results larger than this (OOM guard)

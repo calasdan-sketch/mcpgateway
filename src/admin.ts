@@ -24,6 +24,8 @@ export interface AdminDeps {
   metrics: Metrics;
   getServers: () => DownstreamServer[];
   getNamespace: () => NamespaceResult | null;
+  /** tools whose definition no longer matches its pin */
+  pinMismatches: () => number;
   reloadCatalogs: () => Promise<void>;
 }
 
@@ -75,6 +77,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: AdminDeps
       status: degraded ? 'degraded' : 'ok',
       version: VERSION,
       auditErrors: deps.audit.errors,
+      pinMismatches: deps.pinMismatches(),
       servers,
     });
     return;

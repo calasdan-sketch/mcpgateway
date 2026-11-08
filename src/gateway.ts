@@ -15,6 +15,7 @@ import { DownstreamServer } from './downstream.js';
 import { GatewayUpstream, publicResourceUri, type PromptEntry, type RoutingTable, type UpstreamDeps } from './upstream.js';
 import { buildNamespace, resolveNames, type NamespaceResult } from './namespace.js';
 import { configWarnings, type GatewayConfig } from './config.js';
+import { PinGuard } from './pinning.js';
 import { VERSION } from './version.js';
 
 export interface Gateway {
@@ -54,11 +55,15 @@ export async function startGateway(cfg: GatewayConfig, opts: StartOptions = {}):
   metrics.buildInfo.set({ version: VERSION }, 1);
   const rateLimiter = new RateLimiter();
 
+  const pins = new PinGuard(cfg.pinning.mode, cfg.pinning.file, audit, metrics);
   const state: { namespace: NamespaceResult | null; table: RoutingTable | null } = { namespace: null, table: null };
 
   const rebuildNamespace = (why: string) => {
     try {
-      const catalogs = servers.map((s) => ({ server: s.name, tools: s.getCatalogs().tools }));
+      // Quarantined tools are dropped before the namespace exists: invisible
+      // in listings, and calls get the ordinary unknown-tool error.
+      const held = pins.check(servers.map((s) => ({ server: s.name, tools: s.getCatalogs().tools })));
+      const catalogs = servers.map((s) => ({ server: s.name, tools: s.getCatalogs().tools.filter((t) => !held.has(`${s.name}\0${t.name}`)) }));
       const ns = buildNamespace(catalogs, cfg.namespace);
       state.namespace = ns;
       state.table = buildRoutingTable(servers, ns, cfg);
@@ -142,6 +147,7 @@ export async function startGateway(cfg: GatewayConfig, opts: StartOptions = {}):
         metrics,
         getServers: () => servers,
         getNamespace: () => state.namespace,
+        pinMismatches: () => pins.mismatchCount,
         reloadCatalogs: async () => rebuildNamespace('admin reload'),
       },
       cfg.admin.host,
