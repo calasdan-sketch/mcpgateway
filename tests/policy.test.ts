@@ -13,6 +13,7 @@ const basePolicy = (over: Partial<PolicyConfig> = {}): PolicyConfig => ({
   responseBlock: [],
   responseWarn: [],
   scanWindowChars: 65536,
+  hideSuspicious: false,
   ...over,
 });
 

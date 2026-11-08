@@ -16,6 +16,7 @@ import { GatewayUpstream, publicResourceUri, type PromptEntry, type RoutingTable
 import { buildNamespace, resolveNames, type NamespaceResult } from './namespace.js';
 import { configWarnings, type GatewayConfig } from './config.js';
 import { PinGuard } from './pinning.js';
+import { HiddenCharGuard } from './hiddenchars.js';
 import { VERSION } from './version.js';
 
 export interface Gateway {
@@ -56,13 +57,15 @@ export async function startGateway(cfg: GatewayConfig, opts: StartOptions = {}):
   const rateLimiter = new RateLimiter();
 
   const pins = new PinGuard(cfg.pinning.mode, cfg.pinning.file, audit, metrics);
+  const hiddenChars = new HiddenCharGuard(cfg.policy.hideSuspicious, audit, metrics);
   const state: { namespace: NamespaceResult | null; table: RoutingTable | null } = { namespace: null, table: null };
 
   const rebuildNamespace = (why: string) => {
     try {
       // Quarantined tools are dropped before the namespace exists: invisible
       // in listings, and calls get the ordinary unknown-tool error.
-      const held = pins.check(servers.map((s) => ({ server: s.name, tools: s.getCatalogs().tools })));
+      const raw = servers.map((s) => ({ server: s.name, tools: s.getCatalogs().tools }));
+      const held = new Set([...pins.check(raw), ...hiddenChars.check(raw)]);
       const catalogs = servers.map((s) => ({ server: s.name, tools: s.getCatalogs().tools.filter((t) => !held.has(`${s.name}\0${t.name}`)) }));
       const ns = buildNamespace(catalogs, cfg.namespace);
       state.namespace = ns;

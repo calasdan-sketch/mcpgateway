@@ -48,6 +48,7 @@ policy:
   responseRedact: []      # substrings replaced with [REDACTED] in results
   responseBlock: []       # substrings that block the result entirely
   responseWarn: []        # substrings that only audit-log a warning
+  hideSuspicious: false   # true: hide + deny tools whose metadata has invisible characters (always audited)
 
 auth:
   disabled: false

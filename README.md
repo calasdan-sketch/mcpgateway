@@ -134,6 +134,22 @@ Pinning detects definition changes. It cannot detect a server that keeps its
 definition and changes behaviour. Without `file`, pins live in memory only, so
 a restart re-trusts whatever the servers serve at that moment.
 
+### Invisible-character check
+
+On every catalog build, each tool's `name`, `title`, `description` and every
+string inside its `inputSchema` are scanned for characters a human reviewer
+cannot see but a model reads: the Unicode tag block (U+E0000 to U+E007F),
+zero-width and direction marks (U+200B to U+200F), bidi embeddings and
+overrides (U+202A to U+202E), invisible operators (U+2060 to U+2064), bidi
+isolates (U+2066 to U+2069) and U+FEFF. A flagged tool gets one
+`hidden_chars` audit record (code points and their JSON path), and
+`mcpgateway_hidden_chars_tools` counts flagged tools. By default the tool is
+still served; `policy.hideSuspicious: true` hides it and calls get the
+`unknown tool` error.
+
+It flags invisible characters; it does not judge visible text. Zero-width
+joiners inside legitimate emoji sequences are flagged too.
+
 ### Audit & metrics
 
 One JSONL record per call: timestamp, request id, session, key id, tool,
@@ -149,7 +165,7 @@ Prometheus text on the admin port: `mcpgateway_tool_calls_total`,
 `mcpgateway_tool_call_duration_seconds` (histogram), `mcpgateway_server_up`,
 `mcpgateway_server_inflight`, `mcpgateway_policy_denials_total`,
 `mcpgateway_rate_limit_hits_total`, `mcpgateway_audit_errors_total`,
-`mcpgateway_http_rejected_total`, `mcpgateway_pin_mismatch_total`.
+`mcpgateway_http_rejected_total`, `mcpgateway_pin_mismatch_total`, `mcpgateway_hidden_chars_tools`.
 
 ### Admin API (default `http://127.0.0.1:3001`)
 

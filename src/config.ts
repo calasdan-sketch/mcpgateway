@@ -72,6 +72,8 @@ export interface PolicyConfig {
   responseBlock: string[];
   responseWarn: string[];
   scanWindowChars: number;
+  /** hide + deny tools whose metadata contains invisible characters */
+  hideSuspicious: boolean;
 }
 
 export interface AuthKey {
@@ -433,7 +435,9 @@ export function validateConfig(raw: Raw, source: string, opts: LoadOptions = {})
     responseBlock: strArray(polRaw, 'responseBlock', ctx('policy'), p),
     responseWarn: strArray(polRaw, 'responseWarn', ctx('policy'), p),
     scanWindowChars: optNum(polRaw, 'scanWindowChars', ctx('policy'), 65536, 1024, p),
+    hideSuspicious: polRaw['hideSuspicious'] === true,
   };
+  if (polRaw['hideSuspicious'] !== undefined && typeof polRaw['hideSuspicious'] !== 'boolean') p.push(ctx('policy.hideSuspicious must be boolean'));
   if (policy.mode !== 'enforce' && policy.mode !== 'observe') {
     p.push(ctx('policy.mode must be enforce|observe'));
     policy.mode = 'enforce';
